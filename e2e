@@ -1,0 +1,188 @@
+#!/bin/bash
+# kora end-to-end harness.
+#
+#   ./e2e <cloud|local|both> [--yes] [--only <os>] [--profile <p>] [--destroy-box]
+#
+# Per OS on the chosen side: new -> status running -> cmd -> copy round-trip ->
+# tun probe -> vnc URL -> stop -> start -> cmd -> rm -> state gone. A VM passes
+# when it is SSH-connectable end to end.
+#
+# 'local' iterates every OS the host can run (mac: sequoia debian ubuntu arch;
+# linux: debian ubuntu arch). First runs download images (sequoia is tens of
+# GB). 'cloud' is BILLABLE: it uses/creates the persistent 'kvm' devbox
+# (m7i.large ~$0.10/h) - prompts unless --yes; --destroy-box tears the box
+# down at the end (default: leave it stopped-eligible for reuse).
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KORA="${KORA_BIN:-$SCRIPT_DIR/kora}"
+
+SIDE="${1:-}"
+shift || true
+YES=0
+ONLY=""
+PROFILE=""
+DESTROY_BOX=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --yes) YES=1; shift ;;
+        --only) ONLY="$2"; shift 2 ;;
+        --profile) PROFILE="$2"; shift 2 ;;
+        --destroy-box) DESTROY_BOX=1; shift ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+case "$SIDE" in
+    cloud|local|both) ;;
+    *) echo "usage: ./e2e <cloud|local|both> [--yes] [--only <os>] [--profile <p>] [--destroy-box]" >&2
+       exit 1 ;;
+esac
+
+export KORA_HOME="${KORA_E2E_HOME:-$(mktemp -d)/korahome}"
+WORK="$(mktemp -d)"
+PASS=0
+FAIL=0
+TUN_PID=""
+
+log() { echo "$(date '+%H:%M:%S') [e2e] $*"; }
+
+gate() {   # gate <label> <cmd...>
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+        printf '  %-52s \033[32mPASS\033[0m\n' "$label"; PASS=$((PASS+1)); return 0
+    else
+        printf '  %-52s \033[31mFAIL\033[0m\n' "$label"; FAIL=$((FAIL+1)); return 1
+    fi
+}
+
+gate_loud() {   # like gate but streams output (long steps: new/rm)
+    local label="$1"; shift
+    if "$@"; then
+        printf '  %-52s \033[32mPASS\033[0m\n' "$label"; PASS=$((PASS+1)); return 0
+    else
+        printf '  %-52s \033[31mFAIL\033[0m\n' "$label"; FAIL=$((FAIL+1)); return 1
+    fi
+}
+
+cleanup() {
+    [ -n "$TUN_PID" ] && kill "$TUN_PID" >/dev/null 2>&1
+    "$KORA" rm >/dev/null 2>&1
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'echo; log interrupted; exit 130' SIGINT SIGTERM
+
+tcp_probe() {   # tcp_probe <port> - true when localhost:<port> accepts
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; then
+            exec 3>&- 2>/dev/null
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+run_os() {   # run_os <os> <cloud:0|1>
+    local os="$1" cloud="$2" newargs=()
+    log "=== $os ($([ "$cloud" = 1 ] && echo cloud || echo local)) ==="
+    newargs=(new "$os")
+    if [ "$cloud" = 1 ]; then
+        newargs+=(--cloud --yes)
+        [ -n "$PROFILE" ] && newargs+=(--profile "$PROFILE")
+    fi
+
+    gate_loud "new $os" "$KORA" "${newargs[@]}" || return 1
+
+    gate "status shows running" bash -c "'$KORA' status | grep -q running"
+    gate "cmd true" "$KORA" cmd true
+    gate "cmd exit code propagates" bash -c "! '$KORA' cmd false"
+
+    dd if=/dev/urandom of="$WORK/blob" bs=1024 count=64 2>/dev/null
+    gate "copy to VM" "$KORA" copy "$WORK/blob" vm:/tmp/kora-e2e-blob
+    gate "copy from VM" "$KORA" copy vm:/tmp/kora-e2e-blob "$WORK/blob2"
+    gate "copy round-trip intact" cmp -s "$WORK/blob" "$WORK/blob2"
+    rm -f "$WORK/blob2"
+
+    "$KORA" tun 18123 22 >/dev/null 2>&1 &
+    TUN_PID=$!
+    gate "tun forwards to guest sshd" tcp_probe 18123
+    kill "$TUN_PID" >/dev/null 2>&1; wait "$TUN_PID" 2>/dev/null; TUN_PID=""
+
+    if [ "$cloud" = 1 ]; then
+        "$KORA" vnc >"$WORK/vnc.out" 2>/dev/null &
+        TUN_PID=$!
+        local i=0
+        while [ $i -lt 30 ] && ! grep -q "vnc://" "$WORK/vnc.out" 2>/dev/null; do
+            sleep 2; i=$((i+1))
+        done
+        gate "vnc URL (tunneled)" grep -q "vnc://" "$WORK/vnc.out"
+        kill "$TUN_PID" >/dev/null 2>&1; wait "$TUN_PID" 2>/dev/null; TUN_PID=""
+        gate "guest has /dev/kvm (nested virt)" "$KORA" cmd "test -c /dev/kvm"
+        gate "second new without --force fails" \
+            bash -c "! '$KORA' new debian --cloud --yes 2>/dev/null"
+    else
+        gate "vnc URL" bash -c "'$KORA' vnc </dev/null | grep -q 'vnc://'"
+    fi
+
+    gate_loud "stop" "$KORA" stop
+    gate_loud "start" "$KORA" start --yes
+    gate "cmd after restart" "$KORA" cmd true
+    gate_loud "rm" "$KORA" rm
+    gate "state gone" bash -c "'$KORA' status | grep -q 'no VM'"
+}
+
+local_oses() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "debian ubuntu arch sequoia"
+    else
+        echo "debian ubuntu arch"
+    fi
+}
+
+CLOUD_OSES="debian ubuntu arch"
+
+filter() {   # keep only --only when set
+    if [ -n "$ONLY" ]; then
+        echo "$1" | tr ' ' '\n' | grep -x "$ONLY" || true
+    else
+        echo "$1"
+    fi
+}
+
+if [ "$SIDE" = "cloud" ] || [ "$SIDE" = "both" ]; then
+    if [ "$YES" != 1 ]; then
+        echo "Cloud e2e uses the billable 'kvm' devbox (m7i.large ~\$0.10/h; created if missing)."
+        printf "Continue? [y/N] "
+        read -r ans
+        [ "$ans" = "y" ] || exit 1
+        YES=1
+    fi
+fi
+
+if [ "$SIDE" = "local" ] || [ "$SIDE" = "both" ]; then
+    for os in $(filter "$(local_oses)"); do
+        run_os "$os" 0
+    done
+fi
+
+if [ "$SIDE" = "cloud" ] || [ "$SIDE" = "both" ]; then
+    for os in $(filter "$CLOUD_OSES"); do
+        run_os "$os" 1
+    done
+    log "kora status cloud:"
+    "$KORA" status cloud ${PROFILE:+--profile "$PROFILE"} || FAIL=$((FAIL+1))
+    if [ "$DESTROY_BOX" = 1 ]; then
+        log "destroying the kvm devbox"
+        clouddevbox destroy kvm --yes ${PROFILE:+--profile "$PROFILE"} || FAIL=$((FAIL+1))
+    else
+        log "leaving the kvm devbox up (autostop applies); destroy with: clouddevbox destroy kvm"
+    fi
+fi
+
+echo
+log "== Summary =="
+log "Pass: $PASS  Fail: $FAIL"
+[ "$FAIL" -eq 0 ]
