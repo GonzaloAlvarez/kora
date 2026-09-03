@@ -183,7 +183,10 @@ def test_qemu_arch_argv(home):
     # exposes the serial console on a unix socket for _serial_netfix
     assert "hostfwd=tcp:127.0.0.1:22301-:11838" in install
     assert "-cdrom /x/a.iso" in install and "-boot d" in install
-    assert "unix:" in install and "serial.sock" in install
+    # serial socket lives in a SHORT /tmp path (macOS AF_UNIX 104-byte cap),
+    # not under a possibly-deep KORA_HOME
+    assert "unix:/tmp/kora-arch-22301.sock" in install
+    assert kora.arch_serial_sock(vm) == "/tmp/kora-arch-22301.sock"
 
 
 def test_user_data_render():

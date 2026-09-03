@@ -1068,12 +1068,20 @@ def qemu_common_argv(vm, hostfwd_guest_port, serial=None):
     ]
 
 
+def arch_serial_sock(vm):
+    # A short path: macOS caps AF_UNIX paths at ~104 bytes and a mktemp
+    # KORA_HOME (e.g. amun/test's per-run home under /var/folders/...) blows
+    # past that. Keyed by the per-VM ssh_port so concurrent VMs don't collide.
+    return f"/tmp/kora-arch-{vm['qemu']['ssh_port']}.sock"
+
+
 def qemu_arch_argv(vm, install_iso=None):
     """aarch64 + hvf on macOS (archboot). Install phase forwards archboot's
     sshd (11838) and exposes the serial console on a unix socket so
     _serial_netfix can drive it; run phase forwards 22 and logs the console."""
     d = vm_dir(vm["name"])
-    serial = f"unix:{d / 'serial.sock'},server=on,wait=off" if install_iso else None
+    serial = (f"unix:{arch_serial_sock(vm)},server=on,wait=off"
+              if install_iso else None)
     argv = [
         "qemu-system-aarch64",
         "-machine", "virt,accel=hvf",
@@ -1421,6 +1429,7 @@ class QemuArchBackend:
         if not _qemu_wait_exit(vm, 600):
             raise CliError("installer did not power off within 10 min "
                            f"(console: {d / 'console.log'})")
+        Path(arch_serial_sock(vm)).unlink(missing_ok=True)
         # Do NOT blank efi-vars here: grub-install just registered its boot
         # entry in them (the installer also puts GRUB on the removable path,
         # but the vars are kept as the primary boot source).
@@ -1439,7 +1448,7 @@ class QemuArchBackend:
         upstream networking already works, and the file is copied into the
         installed system by the installer (covers both NIC namings)."""
         d = vm_dir(vm["name"])
-        sock_path = d / "serial.sock"
+        sock_path = arch_serial_sock(vm)
         deadline = time.time() + timeout
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         while True:
@@ -1558,6 +1567,10 @@ class QemuArchBackend:
     @classmethod
     def destroy(cls, vm):
         _qemu_stop(vm, graceful=False)
+        try:
+            Path(arch_serial_sock(vm)).unlink(missing_ok=True)
+        except (KeyError, OSError):
+            pass
 
     @classmethod
     def vnc_url(cls, vm):
