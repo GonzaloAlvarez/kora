@@ -136,7 +136,9 @@ run_os() {   # run_os <os> <cloud:0|1>
 
 local_oses() {
     if [ "$(uname -s)" = "Darwin" ]; then
-        echo "debian ubuntu arch sequoia"
+        # both macOS guests are large pulls (~tens of GB each); use
+        # --only <os> to test one at a time
+        echo "debian ubuntu arch sequoia tahoe"
     else
         echo "debian ubuntu arch"
     fi

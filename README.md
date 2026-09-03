@@ -33,9 +33,9 @@ kora rm                                # delete disk + state
    Image caches and the tart store stay in the default home on purpose, so
    isolated runs never re-download multi-GB images.
 2. **Local backends.** macOS (Apple Silicon): cirruslabs tart images for
-   sequoia/debian/ubuntu, and QEMU+hvf with the archboot unattended installer
-   for arch. Linux: official cloud images (Debian 13, Ubuntu 24.04, Arch)
-   as qcow2 backing files + a cloud-init NoCloud seed, under QEMU+KVM.
+   tahoe/sequoia/debian/ubuntu, and QEMU+hvf with the archboot unattended
+   installer for arch. Linux: official cloud images (Debian 13, Ubuntu 24.04,
+   Arch) as qcow2 backing files + a cloud-init NoCloud seed, under QEMU+KVM.
    QEMU lifecycles are PID-file managed; SSH is a per-VM ed25519 key.
 3. **Cloud mode.** `kora new <os> --cloud` ensures a clouddevbox named `kvm`
    exists for the AWS profile (created `--kvm` with the amun `qemu` plugin,
@@ -52,7 +52,7 @@ kora rm                                # delete disk + state
 
 | Host | Guests | Backend |
 |---|---|---|
-| macOS (Apple Silicon) | sequoia, debian, ubuntu | tart (Virtualization.framework) |
+| macOS (Apple Silicon) | tahoe (macOS 26), sequoia (macOS 15), debian, ubuntu | tart (Virtualization.framework) |
 | macOS (Apple Silicon) | arch | QEMU + hvf (archboot, aarch64) |
 | Linux with /dev/kvm | debian, ubuntu, arch | QEMU + KVM (cloud image + cloud-init, x86_64) |
 | cloud (`--cloud`) | debian, ubuntu, arch | QEMU + KVM on the `kvm` clouddevbox |

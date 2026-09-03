@@ -49,8 +49,13 @@ CLOUD_COST_LINE = ("the 'kvm' devbox is billable EC2 (m7i.large ~$0.10/h while r
 # NoCloud). sequoia has no cloud/Linux story: macOS guests exist only under
 # tart on Apple Silicon.
 CATALOG = {
+    "tahoe": {
+        "tart": "ghcr.io/cirruslabs/macos-tahoe-vanilla:latest",   # macOS 26
+        "cloudimg": None,
+        "sve_fix": False,   # macOS guest: SVE quirk is Linux-guest-only
+    },
     "sequoia": {
-        "tart": "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest",
+        "tart": "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest",  # macOS 15
         "cloudimg": None,
         "sve_fix": False,   # macOS guest: SVE quirk is Linux-guest-only
     },
@@ -2211,7 +2216,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("new", help="create the VM (fails if one exists; --force replaces)")
-    p.add_argument("os", help="debian | ubuntu | arch | sequoia (see kora list)")
+    p.add_argument("os", help="debian | ubuntu | arch | sequoia | tahoe (see kora list)")
     p.add_argument("--ram", help="memory, e.g. 2G or 2048M")
     p.add_argument("--cpu", type=int, help="vCPUs")
     p.add_argument("--hd", help="disk size, e.g. 20G")
