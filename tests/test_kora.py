@@ -177,10 +177,13 @@ def test_qemu_arch_argv(home):
     assert "qemu-system-aarch64" in run_phase and "accel=hvf" in run_phase
     assert "hostfwd=tcp:127.0.0.1:22301-:22" in run_phase
     assert "-cdrom" not in run_phase
+    assert "file:" in run_phase and "console.log" in run_phase
     install = " ".join(kora.qemu_arch_argv(vm, install_iso="/x/a.iso"))
-    # install phase forwards archboot's sshd, not 22, and boots the ISO
+    # install phase forwards archboot's sshd, not 22, boots the ISO, and
+    # exposes the serial console on a unix socket for _serial_netfix
     assert "hostfwd=tcp:127.0.0.1:22301-:11838" in install
     assert "-cdrom /x/a.iso" in install and "-boot d" in install
+    assert "unix:" in install and "serial.sock" in install
 
 
 def test_user_data_render():

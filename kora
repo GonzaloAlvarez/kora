@@ -263,6 +263,17 @@ fi
 echo "Installing base git python iptables-nft kmscon linux polkit btrfs-progs e2fsprogs dosfstools terminus-font ttf-hack-nerd..."
 sleep 2
 
+# kora: newer archboot live envs boot with NO initialized pacman keyring, and
+# 'pacman --root' resolves its gpgdir under the new root - init + populate
+# both sides or the base install dies with 'keyring is not writable /
+# required key missing from keyring'.
+echo "Initializing pacman keyrings (live + destination)..."
+pacman-key --init &>"${_LOG}"
+pacman-key --populate &>"${_LOG}"
+mkdir -p /mnt/install/etc/pacman.d/gnupg
+pacman-key --gpgdir /mnt/install/etc/pacman.d/gnupg --init &>"${_LOG}"
+pacman-key --gpgdir /mnt/install/etc/pacman.d/gnupg --populate &>"${_LOG}"
+
 # Retry pacman installation up to 3 times
 RETRY_COUNT=0
 MAX_RETRIES=3
@@ -323,7 +334,19 @@ echo "Enable clock setting on installed system..."
 cp /etc/adjtime "${_DESTDIR}"/etc/adjtime
 echo "Enable network and disable wifi on installed system..."
 cp /etc/systemd/network/* "${_DESTDIR}"/etc/systemd/network/ &>"${_NO_LOG}"
+# kora: archboot pins its DHCP profile to enp0s1, but the QEMU virtio NIC
+# enumerates as eth0 - drop a name-agnostic Type=ether DHCP profile so the
+# installed system gets an address whatever the interface is named.
+{
+echo "[Match]"
+echo "Type=ether"
+echo "Kind=!*"
+echo ""
+echo "[Network]"
+echo "DHCP=yes"
+} > "${_DESTDIR}/etc/systemd/network/10-kora-dhcp.network"
 chroot "${_DESTDIR}" systemctl enable systemd-networkd &>"${_NO_LOG}"
+chroot "${_DESTDIR}" systemctl enable systemd-resolved &>"${_NO_LOG}"
 mkdir -p "${_DESTDIR}/etc/systemd/network.conf.d"
 cp /etc/systemd/network.conf.d/ipv6-privacy-extensions.conf "${_DESTDIR}"/etc/systemd/network.conf.d/ipv6-privacy-extensions.conf
 echo "Create new fstab on installed system..."
@@ -594,6 +617,9 @@ _chroot_umount
 echo "Setting up GRUB(2) UEFI..."
 _chroot_mount
 chroot "${_DESTDIR}" grub-install --directory="/usr/lib/grub/arm64-efi" --target="arm64-efi" --efi-directory="/efi" --bootloader-id="GRUB" --recheck --debug &>"${_LOG}"
+# kora: also install to the removable path (\EFI\BOOT\BOOTAA64.EFI) so the
+# system boots even with a blank/replaced UEFI variable store.
+chroot "${_DESTDIR}" grub-install --directory="/usr/lib/grub/arm64-efi" --target="arm64-efi" --efi-directory="/efi" --removable --recheck &>"${_LOG}"
 mkdir -p "${_DESTDIR}/boot/grub/fonts"
 cp -f "${_DESTDIR}/usr/share/grub/ter-u16n.pf2" "${_DESTDIR}/boot/grub/fonts/ter-u16n.pf2"
 
@@ -932,19 +958,30 @@ def vm_ssh(vm, command, check=False, quiet=False):
 
 def wait_ssh(vm, timeout, password=None):
     """Poll until ssh answers. With password set, authenticate by password
-    (sshpass if present, SSH_ASKPASS otherwise) - used before key injection."""
+    (sshpass if present, SSH_ASKPASS otherwise) - used before key injection.
+
+    Each probe is hard-capped: ConnectTimeout only bounds the TCP connect, not
+    the banner exchange, and a fresh guest whose sshd is still generating host
+    keys can stall a probe indefinitely - a couple of those would otherwise
+    eat the whole budget."""
     log(f"waiting for SSH on {vm['ssh']['host']}:{vm['ssh']['port']}")
     deadline = time.time() + timeout
+    # -oConnectionAttempts + a subprocess timeout together bound each probe
+    probe_extra = ["-o", "ConnectTimeout=4"]
     while time.time() < deadline:
-        if password:
-            rc = _password_ssh(vm, "true", password,
-                               extra=["-o", "ConnectTimeout=2"], quiet=True)
-        else:
-            user, host, port, key = ssh_target(vm)
-            rc = run(["ssh", *SSH_BASE_OPTS, "-o", "BatchMode=yes",
-                      "-o", "ConnectTimeout=2", "-p", str(port), "-i", key,
-                      f"{user}@{host}", "true"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        try:
+            if password:
+                rc = _password_ssh(vm, "true", password, extra=probe_extra,
+                                   quiet=True, hard_timeout=15)
+            else:
+                user, host, port, key = ssh_target(vm)
+                rc = run(["ssh", *SSH_BASE_OPTS, "-o", "BatchMode=yes",
+                          *probe_extra, "-p", str(port), "-i", key,
+                          f"{user}@{host}", "true"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         timeout=15).returncode
+        except subprocess.TimeoutExpired:
+            rc = 1      # banner stall - keep polling, do not burn the budget
         if rc == 0:
             return
         time.sleep(1)
@@ -961,9 +998,11 @@ def _askpass_script(password):
     return p
 
 
-def _password_ssh(vm, command, password, extra=None, stdin_file=None, quiet=False):
+def _password_ssh(vm, command, password, extra=None, stdin_file=None,
+                  quiet=False, hard_timeout=None):
     """ssh with password/passphrase auth: sshpass when available, else
-    SSH_ASKPASS_REQUIRE=force (OpenSSH >= 8.4)."""
+    SSH_ASKPASS_REQUIRE=force (OpenSSH >= 8.4). hard_timeout bounds the whole
+    attempt (banner stalls); it re-raises subprocess.TimeoutExpired."""
     user, host, port, key = ssh_target(vm)
     passphrase_mode = bool(key) and Path(key).exists() and password != TART_VM_PASSWORD
     base = ["ssh", *SSH_BASE_OPTS, "-p", str(port), *(extra or [])]
@@ -987,6 +1026,8 @@ def _password_ssh(vm, command, password, extra=None, stdin_file=None, quiet=Fals
     if quiet:
         kw["stdout"] = subprocess.DEVNULL
         kw["stderr"] = subprocess.DEVNULL
+    if hard_timeout:
+        kw["timeout"] = hard_timeout
     try:
         return run(argv, **kw).returncode
     finally:
@@ -1011,7 +1052,7 @@ def inject_key(vm, password):
 # ---------------------------------------------------------------------------
 # qemu argv builders (pure - unit-testable)
 # ---------------------------------------------------------------------------
-def qemu_common_argv(vm, hostfwd_guest_port):
+def qemu_common_argv(vm, hostfwd_guest_port, serial=None):
     q = vm["qemu"]
     d = vm_dir(vm["name"])
     return [
@@ -1020,7 +1061,7 @@ def qemu_common_argv(vm, hostfwd_guest_port):
         "-netdev", ("user,id=net0,hostfwd=tcp:127.0.0.1:"
                     f"{q['ssh_port']}-:{hostfwd_guest_port}"),
         "-display", "none", "-monitor", "none",
-        "-serial", f"file:{d / 'console.log'}",
+        "-serial", serial or f"file:{d / 'console.log'}",
         "-vnc", f"127.0.0.1:{q['vnc_display']}",
         "-pidfile", str(d / "qemu.pid"),
         "-daemonize",
@@ -1029,8 +1070,10 @@ def qemu_common_argv(vm, hostfwd_guest_port):
 
 def qemu_arch_argv(vm, install_iso=None):
     """aarch64 + hvf on macOS (archboot). Install phase forwards archboot's
-    sshd (11838); run phase forwards 22."""
+    sshd (11838) and exposes the serial console on a unix socket so
+    _serial_netfix can drive it; run phase forwards 22 and logs the console."""
     d = vm_dir(vm["name"])
+    serial = f"unix:{d / 'serial.sock'},server=on,wait=off" if install_iso else None
     argv = [
         "qemu-system-aarch64",
         "-machine", "virt,accel=hvf",
@@ -1039,7 +1082,7 @@ def qemu_arch_argv(vm, install_iso=None):
         "-drive", f"id=disk0,if=none,format=qcow2,file={d / 'disk.qcow2'},discard=on",
         "-drive", f"if=pflash,format=raw,file={cache_dir('firmware') / 'edk2-aarch64-code.fd'},readonly=on",
         "-drive", f"if=pflash,format=raw,file={d / 'efi-vars.fd'}",
-    ] + qemu_common_argv(vm, 11838 if install_iso else 22)
+    ] + qemu_common_argv(vm, 11838 if install_iso else 22, serial=serial)
     if install_iso:
         argv += ["-cdrom", str(install_iso), "-boot", "d"]
     return argv
@@ -1372,16 +1415,78 @@ class QemuArchBackend:
         log("booting archboot installer (unattended install, ~10-20 min)")
         if run(qemu_arch_argv(vm, install_iso=iso)).returncode != 0:
             raise CliError("qemu installer boot failed")
+        cls._serial_netfix(vm)
         cls._run_installer(vm, release_key)
         log("waiting for installer VM to power off")
         if not _qemu_wait_exit(vm, 600):
             raise CliError("installer did not power off within 10 min "
                            f"(console: {d / 'console.log'})")
-        cls._blank_vars(d)
+        # Do NOT blank efi-vars here: grub-install just registered its boot
+        # entry in them (the installer also puts GRUB on the removable path,
+        # but the vars are kept as the primary boot source).
         log("booting installed Arch VM")
         if run(qemu_arch_argv(vm)).returncode != 0:
             raise CliError("qemu boot failed")
         wait_ssh(vm, 300)
+
+    @classmethod
+    def _serial_netfix(cls, vm, timeout=300):
+        """archboot's live env (seen from 2026.08.31 on) boots with no
+        address: its stock 10-wired-auto-dhcp.network lacks DHCP=yes and the
+        installer's own profile matches enp0s1 while the live NIC is eth0 -
+        so sshd listens but the hostfwd can never reach it. Drive the serial
+        console to a root shell and write an eth0 DHCP profile; harmless when
+        upstream networking already works, and the file is copied into the
+        installed system by the installer (covers both NIC namings)."""
+        d = vm_dir(vm["name"])
+        sock_path = d / "serial.sock"
+        deadline = time.time() + timeout
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        while True:
+            try:
+                s.connect(str(sock_path))
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise CliError("archboot serial socket never appeared")
+                time.sleep(1)
+        s.settimeout(2)
+        buf = b""
+        lf = open(d / "console.log", "ab")
+
+        def drain(seconds):
+            nonlocal buf
+            end = time.time() + seconds
+            while time.time() < end:
+                try:
+                    data = s.recv(4096)
+                    if not data:
+                        return
+                    buf += data
+                    lf.write(data)
+                except socket.timeout:
+                    pass
+
+        log("waiting for the archboot console banner")
+        # match single words: the banner interleaves ANSI color escapes
+        # between words, so multi-word substrings never appear contiguously
+        while b"routine" not in buf and b"ENTER" not in buf:
+            drain(2)
+            if time.time() > deadline:
+                lf.close()
+                s.close()
+                raise CliError("archboot console never showed its banner "
+                               f"(see {d / 'console.log'})")
+        s.sendall(b"\x03")      # CTRL-C -> root shell (per the banner)
+        drain(3)
+        log("enabling DHCP on the live environment's eth0")
+        s.sendall(b"printf '[Match]\\nName=eth0\\n[Network]\\nDHCP=yes\\n'"
+                  b" > /etc/systemd/network/20-eth0.network"
+                  b" && systemctl restart systemd-networkd\n")
+        drain(5)
+        lf.flush()
+        lf.close()
+        s.close()
 
     @classmethod
     def _run_installer(cls, vm, release_key):
@@ -1438,7 +1543,10 @@ class QemuArchBackend:
 
     @classmethod
     def start(cls, vm):
-        cls._blank_vars(vm_dir(vm["name"]))
+        # vars persist across boots (they hold grub's NVRAM entry); recreate
+        # only if lost - the removable-path GRUB still boots then.
+        if not (vm_dir(vm["name"]) / "efi-vars.fd").exists():
+            cls._blank_vars(vm_dir(vm["name"]))
         if run(qemu_arch_argv(vm)).returncode != 0:
             raise CliError("qemu boot failed")
         wait_ssh(vm, 300)
@@ -1791,6 +1899,10 @@ def cmd_new(args):
     try:
         backend.create(vm)
     except BaseException:
+        if os.environ.get("KORA_KEEP_FAILED"):
+            log(f"create failed; KORA_KEEP_FAILED set - artifacts left in "
+                f"{vm_dir(vm['name'])}")
+            raise
         log("create failed; cleaning up partial VM")
         try:
             backend.destroy(vm)
