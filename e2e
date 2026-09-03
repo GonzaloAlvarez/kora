@@ -10,8 +10,8 @@
 # 'local' iterates every OS the host can run (mac: sequoia debian ubuntu arch;
 # linux: debian ubuntu arch). First runs download images (sequoia is tens of
 # GB). 'cloud' is BILLABLE: it uses/creates the persistent 'kvm' devbox
-# (m7i.large ~$0.10/h) - prompts unless --yes; --destroy-box tears the box
-# down at the end (default: leave it stopped-eligible for reuse).
+# (m7i.large ~$0.10/h) - prompts unless --yes. At the end the box is STOPPED
+# (kept for reuse, EBS-only cost); --destroy-box tears it down completely.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -178,7 +178,10 @@ if [ "$SIDE" = "cloud" ] || [ "$SIDE" = "both" ]; then
         log "destroying the kvm devbox"
         clouddevbox destroy kvm --yes ${PROFILE:+--profile "$PROFILE"} || FAIL=$((FAIL+1))
     else
-        log "leaving the kvm devbox up (autostop applies); destroy with: clouddevbox destroy kvm"
+        # Stop (not leave running): a running m7i.large bills ~$0.10/h until
+        # the 12h autostop, but the box is kept for reuse (EBS-only stopped).
+        log "stopping the kvm devbox (kept for reuse; EBS-only cost)"
+        clouddevbox stop kvm ${PROFILE:+--profile "$PROFILE"} || FAIL=$((FAIL+1))
     fi
 fi
 
