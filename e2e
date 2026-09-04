@@ -134,6 +134,41 @@ run_os() {   # run_os <os> <cloud:0|1>
     gate "state gone" bash -c "'$KORA' status | grep -q 'no VM'"
 }
 
+# Omarchy is a special cloud-only case: it destroys+recreates the box at
+# m7i.xlarge and installs from ISO (~15-40 min), so it can't share a run with
+# the debian/ubuntu/arch gates. Opt in with: ./e2e cloud --only omarchy --yes
+run_omarchy() {
+    log "=== omarchy (cloud) ==="
+    local newargs=(new omarchy --cloud --yes)
+    [ -n "$PROFILE" ] && newargs+=(--profile "$PROFILE")
+    gate_loud "new omarchy (destroy+recreate m7i.xlarge, install)" \
+        "$KORA" "${newargs[@]}" || return 1
+
+    gate "status shows running" bash -c "'$KORA' status | grep -q running"
+    gate "guest is Omarchy" bash -c "'$KORA' cmd 'cat /etc/os-release' | grep -qi omarchy"
+    gate "user gonzalo in wheel" bash -c "'$KORA' cmd id | grep -q 'wheel'"
+    gate "Hyprland present" "$KORA" cmd "command -v Hyprland"
+
+    "$KORA" vnc >"$WORK/vnc.out" 2>/dev/null &
+    TUN_PID=$!
+    local i=0
+    while [ $i -lt 30 ] && ! grep -q "vnc://" "$WORK/vnc.out" 2>/dev/null; do
+        sleep 2; i=$((i+1))
+    done
+    gate "vnc URL (tunneled)" grep -q "vnc://" "$WORK/vnc.out"
+    kill "$TUN_PID" >/dev/null 2>&1; wait "$TUN_PID" 2>/dev/null; TUN_PID=""
+
+    # reset: wipe the guest, keep the EC2 box running
+    "$KORA" cmd 'touch ~/RESET_ME' >/dev/null 2>&1
+    gate_loud "reset (nested guest)" "$KORA" reset
+    gate "reset wiped the guest (marker gone)" \
+        bash -c "! '$KORA' cmd 'test -e ~/RESET_ME' 2>/dev/null"
+    gate "reset kept the EC2 box running" \
+        bash -c "'$KORA' status cloud ${PROFILE:+--profile $PROFILE} | grep -q running"
+
+    gate_loud "rm (keeps the box)" "$KORA" rm
+}
+
 local_oses() {
     if [ "$(uname -s)" = "Darwin" ]; then
         # both macOS guests are large pulls (~tens of GB each); use
@@ -171,9 +206,13 @@ if [ "$SIDE" = "local" ] || [ "$SIDE" = "both" ]; then
 fi
 
 if [ "$SIDE" = "cloud" ] || [ "$SIDE" = "both" ]; then
-    for os in $(filter "$CLOUD_OSES"); do
-        run_os "$os" 1
-    done
+    if [ "$ONLY" = "omarchy" ]; then
+        run_omarchy
+    else
+        for os in $(filter "$CLOUD_OSES"); do
+            run_os "$os" 1
+        done
+    fi
     log "kora status cloud:"
     "$KORA" status cloud ${PROFILE:+--profile "$PROFILE"} || FAIL=$((FAIL+1))
     if [ "$DESTROY_BOX" = 1 ]; then

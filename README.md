@@ -11,6 +11,7 @@ on a persistent AWS devbox (via [clouddevbox]) when the guest needs real
 kora new debian                        # local VM (tart on macOS, QEMU+KVM on Linux)
 kora new sequoia --ram 8G --cpu 4      # macOS guest (Apple Silicon Mac only)
 kora new debian --cloud                # QEMU+KVM guest on the 'kvm' devbox (billable)
+kora new omarchy --cloud               # Omarchy (Arch+Hyprland) desktop, cloud-only
 kora new arch --force                  # replace whatever VM exists
 kora list                              # catalog: which OS runs where
 kora status                            # the active VM; 'kora status cloud' = the devbox
@@ -20,6 +21,8 @@ kora copy report.txt vm:/tmp/          # scp either direction (one side vm:<path
 kora tun 8080 80                       # localhost:8080 -> VM's 127.0.0.1:80
 kora vnc                               # print (and open) the display URL
 kora stop && kora start                # halt (disk kept) / resume
+kora reset                             # wipe back to clean (cloud: resets the nested
+                                       # guest, never stops the devbox)
 kora rm                                # delete disk + state
 ```
 
@@ -47,6 +50,18 @@ kora rm                                # delete disk + state
 4. **Profile selection is delegated.** Without `--profile`, kora runs
    `clouddevbox profile` (bullet picker on a tty) and persists the answer in
    the VM state so every later call reuses it.
+5. **Omarchy (cloud-only).** `kora new omarchy --cloud` boots the Omarchy ISO
+   with an unattended cidata drive (user `gonzalo`, kora's per-VM key, **no
+   LUKS**) and installs to disk on the `kvm` devbox at **m7i.xlarge**. Because
+   Omarchy needs a known size and a pristine host, an existing `kvm` box is
+   destroyed and recreated (confirmed unless `--yes`). The first install
+   (~15-40 min) runs detached on the box and is snapshotted to a cached base;
+   later `kora new omarchy` / `kora reset` are instant COW overlays off it.
+   `kora vnc` tunnels to the Hyprland desktop.
+6. **reset.** `kora reset` returns the VM to clean. Local: stop, wipe, restart.
+   Cloud: resets the nested guest **on the box** — the EC2 devbox keeps
+   running (never stopped). Fast for omarchy/cloud-image guests (base overlay);
+   arch reinstalls.
 
 ## Supported platforms
 
@@ -55,7 +70,8 @@ kora rm                                # delete disk + state
 | macOS (Apple Silicon) | tahoe (macOS 26), sequoia (macOS 15), debian, ubuntu | tart (Virtualization.framework) |
 | macOS (Apple Silicon) | arch | QEMU + hvf (archboot, aarch64) |
 | Linux with /dev/kvm | debian, ubuntu, arch | QEMU + KVM (cloud image + cloud-init, x86_64) |
-| cloud (`--cloud`) | debian, ubuntu, arch | QEMU + KVM on the `kvm` clouddevbox |
+| cloud (`--cloud`) | debian, ubuntu, arch | QEMU + KVM on the `kvm` clouddevbox (m7i.large) |
+| cloud only (`--cloud`) | omarchy | QEMU + KVM ISO install on the `kvm` clouddevbox (m7i.xlarge) |
 
 Dependencies are binaries, never pip packages: `tart` + `sshpass`
 (`brew install cirruslabs/cli/tart cirruslabs/cli/sshpass`), `qemu`
@@ -93,6 +109,18 @@ amun `qemu` plugin), `clouddevbox` (gear) for cloud mode.
 - **VNC**: tart guests get their URL from the tart log (`--vnc-experimental`);
   QEMU guests listen on loopback (`vnc://127.0.0.1:59xx`); cloud guests are
   reached through a held-open tunnel (`kora vnc` blocks until ctrl-c).
+- **Omarchy cidata schema** is version-sensitive: `omarchy_user_configuration`
+  is byte-matched to Omarchy 4's Configurator output (archinstall + Limine +
+  btrfs). On an Omarchy version bump, re-capture it (the ISO's Configurator
+  writes the exact JSON, or see `omacom/omarchy-iso`'s integration test); pin
+  the ISO with `KORA_OMARCHY_VERSION`.
+- **Omarchy shares the `kvm` box** but needs m7i.xlarge, so `kora new omarchy`
+  destroys+recreates the box (confirmed unless `--yes`). A following amun
+  cloud test finds it at xlarge (works, slightly more $) or recreates it at
+  m7i.large — some churn is inherent to one shared box name.
+- **Omarchy display**: renders on `virtio-vga` over VNC (Omarchy's own CI uses
+  this). Its default is a 2× HiDPI scale; at 1080p over VNC adjust
+  `~/.config/hypr/monitors.lua` if it looks zoomed.
 
 ## License
 
