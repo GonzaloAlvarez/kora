@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -47,7 +47,12 @@ CLOUD_COST_LINE = ("the 'kvm' devbox is billable EC2 (m7i.large ~$0.10/h while r
 # Guest catalog. 'tart' images are cirruslabs OCI images; 'cloudimg' are the
 # official qcow2 cloud images used by the Linux QEMU+KVM backend (cloud-init
 # NoCloud). sequoia has no cloud/Linux story: macOS guests exist only under
-# tart on Apple Silicon.
+# tart on Apple Silicon. omarchy is cloud-only: an x86_64 UEFI ISO installer
+# (no tart/cloudimg), run via the qemu-omarchy backend on the KVM devbox.
+#
+# Per-OS keys: tart (OCI image | None), cloudimg (qcow2 URL | None),
+# sve_fix (bool), and optionally: iso ({ver} URL template), backend (explicit
+# backend name), cloud_only (bool), instance_type (required EC2 type).
 CATALOG = {
     "tahoe": {
         "tart": "ghcr.io/cirruslabs/macos-tahoe-vanilla:latest",   # macOS 26
@@ -77,7 +82,24 @@ CATALOG = {
                     "Arch-Linux-x86_64-cloudimg.qcow2",
         "sve_fix": False,   # qemu+hvf masks SVE; the tart quirk does not apply
     },
+    "omarchy": {            # DHH's Arch + Hyprland desktop distro (x86_64 UEFI)
+        "tart": None,
+        "cloudimg": None,
+        "iso": "https://iso.omarchy.org/omarchy-{ver}.iso",
+        "backend": "qemu-omarchy",
+        "cloud_only": True,         # no local backend (Mac can't nest x86 KVM)
+        "instance_type": "m7i.xlarge",
+        "sve_fix": False,
+    },
 }
+
+# No "latest" URL for the Omarchy ISO - versioned, with a .sha256 sidecar.
+OMARCHY_VERSION = os.environ.get("KORA_OMARCHY_VERSION", "4.0.2")
+OMARCHY_USER = "gonzalo"
+# Throwaway password for the disposable Omarchy guest (key auth is primary;
+# a password is still needed for sudo/lock-screen). openssl passwd -6 of
+# "omarchy". Regenerate with: openssl passwd -6 "<pw>".
+OMARCHY_PASSWORD = "omarchy"
 
 # The ISO and the ssh login key (embedded in Release.txt) MUST come from the
 # same release: archboot rotates the key per build, and "latest" is sometimes
@@ -88,6 +110,11 @@ ARCHBOOT_BASE = "https://release.archboot.com/aarch64"
 DEFAULT_QEMU_RAM = "4G"
 DEFAULT_QEMU_CPU = 4
 DEFAULT_QEMU_HD = "30G"
+# omarchy runs a Hyprland desktop; more headroom (fits inside m7i.xlarge = 4
+# vCPU / 16 GiB, leaving room for the box OS).
+OMARCHY_RAM = "8G"
+OMARCHY_CPU = 4
+OMARCHY_HD = "40G"
 SSH_PORT_RANGE = (22300, 22399)
 VNC_DISPLAY_RANGE = (10, 99)
 
@@ -1659,16 +1686,331 @@ class QemuCloudimgBackend:
         return f"vnc://127.0.0.1:{5900 + vm['qemu']['vnc_display']}"
 
 
-BACKENDS = {b.name: b for b in (TartBackend, QemuArchBackend, QemuCloudimgBackend)}
+# ---------------------------------------------------------------------------
+# Omarchy (cloud-only): x86_64 UEFI ISO installer, unattended via a cidata
+# drive; installs to disk and auto-reboots into the finished system. Runs on
+# the KVM devbox. First install (~15-20 min) is snapshotted to a cached base
+# so every later new/reset is an instant COW overlay.
+# ---------------------------------------------------------------------------
+def find_ovmf():
+    """Locate x86_64 OVMF (UEFI) code + writable-vars template. Debian's 'ovmf'
+    package (installed by the amun 'qemu' plugin) ships 4M builds under
+    /usr/share/OVMF; Arch under /usr/share/edk2/x64. Avoid Secure-Boot / MS-
+    keyed variants so the unsigned Omarchy kernel boots."""
+    roots = ["/usr/share/OVMF", "/usr/share/edk2/x64",
+             "/usr/share/edk2-ovmf/x64", "/usr/share/qemu"]
+    for root in roots:
+        p = Path(root)
+        if not p.is_dir():
+            continue
+        codes = [c for c in p.glob("OVMF_CODE*.fd")
+                 if ".ms." not in c.name.lower() and "secboot" not in c.name.lower()]
+        if not codes:
+            continue
+        codes.sort(key=lambda f: "4m" not in f.name.lower())   # prefer 4M
+        code = codes[0]
+        varst = Path(str(code).replace("CODE", "VARS"))
+        if varst.exists():
+            return code, varst
+    raise CliError("OVMF firmware not found; install 'ovmf' (the amun qemu plugin "
+                   "does this) - looked under /usr/share/OVMF and /usr/share/edk2")
+
+
+def omarchy_iso_url():
+    return CATALOG["omarchy"]["iso"].format(ver=OMARCHY_VERSION)
+
+
+def omarchy_user_configuration(hostname="omarchy"):
+    """archinstall config for an UNENCRYPTED unattended install to /dev/vda
+    (the guest's virtio-blk disk). No 'disk_encryption' block => no LUKS =>
+    fully unattended (no boot-time passphrase).
+
+    WARNING: archinstall's config schema drifts between versions; these fields
+    must be validated against the archinstall bundled in the pinned Omarchy
+    ISO (Omarchy docs: run one interactive install and copy /root/*.json).
+    Keep this the single place to fix on a version bump."""
+    return {
+        "archinstall-language": "English (United States)",
+        "bootloader": "Systemd-boot",
+        "hostname": hostname,
+        "kernels": ["linux"],
+        "locale_config": {"kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US"},
+        "timezone": "UTC",
+        "ntp": True,
+        "swap": True,
+        "disk_config": {
+            "config_type": "default_layout",
+            "device_modifications": [{
+                "device": "/dev/vda",
+                "wipe": True,
+                "partitions": [
+                    {"type": "primary", "status": "create",
+                     "flags": ["boot", "esp"], "fs_type": "fat32",
+                     "mountpoint": "/boot",
+                     "start": {"unit": "MiB", "value": 1},
+                     "size": {"unit": "MiB", "value": 1024}},
+                    {"type": "primary", "status": "create",
+                     "fs_type": "ext4", "mountpoint": "/",
+                     "start": {"unit": "MiB", "value": 1025},
+                     "size": {"unit": "Percent", "value": 100}},
+                ],
+            }],
+        },
+    }
+
+
+def omarchy_user_credentials(username, password_hash):
+    """archinstall credentials: one sudo user, no root password."""
+    return {
+        "users": [{"username": username, "enc_password": password_hash, "sudo": True}],
+        "root_enc_password": None,
+    }
+
+
+def _passwd_hash(pw):
+    rc, out, _ = run_out(["openssl", "passwd", "-6", pw])
+    if rc != 0 or not out.strip():
+        raise CliError("openssl passwd -6 failed (openssl not on PATH?)")
+    return out.strip().splitlines()[-1].strip()
+
+
+def build_cidata_iso(dest_iso, username, password_hash, pubkey):
+    """Write the three cidata files and pack them into a NoCloud-labeled ISO
+    (label 'cidata'). Returns the config-layout sha that keys the cached base
+    (independent of the per-install key/password so the base is reusable)."""
+    staged = dest_iso.parent / "cidata"
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.mkdir(parents=True)
+    config = omarchy_user_configuration()
+    (staged / "user_configuration.json").write_text(json.dumps(config, indent=2))
+    (staged / "user_credentials.json").write_text(
+        json.dumps(omarchy_user_credentials(username, password_hash), indent=2))
+    (staged / "authorized_keys").write_text(pubkey.strip() + "\n")
+    # No user_encrypt_installation.txt and no disk_encryption block => no LUKS.
+    tool = ensure_iso_tool()
+    if run([*tool, "-output", str(dest_iso), "-volid", "cidata", "-joliet",
+            "-rock", str(staged)],
+           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        raise CliError("cidata ISO build failed")
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def qemu_omarchy_argv(vm, install=False):
+    """q35+KVM UEFI guest mirroring omacom/omarchy-iso's own test harness:
+    virtio-blk disk (bootindex 1), virtio-vga + VNC, usb-tablet. install=True
+    also attaches the Omarchy ISO (ide-cd, bootindex 2) and the cidata ISO so
+    the installer runs unattended; install=False boots the installed disk only
+    (so a provisioned VM never re-enters the installer)."""
+    d = vm_dir(vm["name"])
+    q = vm["qemu"]
+    argv = [
+        "qemu-system-x86_64",
+        "-machine", "q35,accel=kvm",
+        "-cpu", "host", "-enable-kvm",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={q['ovmf_code']}",
+        "-drive", f"if=pflash,format=raw,file={d / 'OVMF_VARS.fd'}",
+        "-drive", f"file={d / 'disk.qcow2'},format=qcow2,if=none,id=disk0",
+        "-device", "virtio-blk-pci,drive=disk0,bootindex=1",
+        "-device", "virtio-vga",
+        "-usb", "-device", "usb-tablet",
+        "-qmp", f"unix:{q['qmp_sock']},server=on,wait=off",
+    ]
+    if install:
+        argv += [
+            "-drive", f"file={q['iso']},media=cdrom,if=none,format=raw,id=cd0",
+            "-device", "ide-cd,drive=cd0,bootindex=2",
+            "-drive", f"file={d / 'cidata.iso'},media=cdrom,if=none,format=raw,id=cd1",
+            "-device", "ide-cd,drive=cd1",
+        ]
+    return argv + qemu_common_argv(vm, 22)
+
+
+def _qmp_powerdown(vm, timeout=180):
+    """Clean ACPI shutdown via QMP - no guest sudo needed (gonzalo's sudo may
+    prompt). Falls back to SIGTERM/SIGKILL. Used before snapshotting the base
+    so the qcow2 is quiesced."""
+    sock_path = vm.get("qemu", {}).get("qmp_sock")
+    if sock_path and Path(sock_path).exists():
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(sock_path)
+            s.recv(4096)                                    # QMP greeting
+            s.sendall(b'{"execute":"qmp_capabilities"}\n'); s.recv(4096)
+            s.sendall(b'{"execute":"system_powerdown"}\n'); s.recv(4096)
+            s.close()
+        except OSError:
+            pass
+    if not _qemu_wait_exit(vm, timeout):
+        _qemu_stop(vm, graceful=False)
+
+
+class QemuOmarchyBackend:
+    name = "qemu-omarchy"
+
+    @staticmethod
+    def _ensure_tools():
+        if not shutil.which("qemu-system-x86_64"):
+            raise CliError("qemu-system-x86_64 not found; converge the amun 'qemu' "
+                           "plugin or apt-get install qemu-system-x86")
+        if not Path("/dev/kvm").exists():
+            raise CliError("/dev/kvm missing - omarchy needs nested KVM")
+        if not shutil.which("openssl"):
+            raise CliError("openssl not found (needed for the user password hash)")
+        ensure_iso_tool()
+        find_ovmf()
+
+    @classmethod
+    def _fetch_iso(cls):
+        url = omarchy_iso_url()
+        d = cache_dir("omarchy", OMARCHY_VERSION)
+        iso = d / f"omarchy-{OMARCHY_VERSION}.iso"
+        if not iso.exists():
+            log(f"downloading {url}")
+            fetch(url, iso)
+            # best-effort checksum against the .sha256 sidecar
+            rc, sums, _ = run_out(["curl", "-fsSL", url + ".sha256"])
+            if rc == 0 and sums.strip():
+                want = sums.split()[0].strip()
+                if want and sha256_file(iso) != want:
+                    iso.unlink(missing_ok=True)
+                    raise CliError("Omarchy ISO checksum mismatch (re-download)")
+        return iso
+
+    @classmethod
+    def create(cls, vm):
+        cls._ensure_tools()
+        d = vm_dir(vm["name"])
+        iso = cls._fetch_iso()
+        ovmf_code, ovmf_vars_tmpl = find_ovmf()
+        port = alloc_port()
+        disp = alloc_vnc_display()
+        vm["qemu"] = {"ssh_port": port, "vnc_display": disp, "arch": "x86_64",
+                      "ovmf_code": str(ovmf_code), "iso": str(iso),
+                      "qmp_sock": str(d / "qmp.sock")}
+        # Base cache key = ISO content + config layout (independent of the
+        # per-install password/key). The base install bakes in a STABLE key
+        # (below) so cached-base overlays stay ssh-reachable across new/reset
+        # with no re-keying.
+        iso_sha = sha256_file(iso)[:12]
+        cfg_sha = hashlib.sha256(
+            json.dumps(omarchy_user_configuration(), sort_keys=True).encode()
+        ).hexdigest()[:12]
+        base_key = f"{iso_sha}-{cfg_sha}"
+        base_dir = cache_dir("omarchy-base") / base_key
+        base_disk = base_dir / "base.qcow2"
+        base_vars = base_dir / "OVMF_VARS.fd"
+        base_sshkey = base_dir / "id_ed25519"
+        vm["ssh"] = {"user": OMARCHY_USER, "host": "127.0.0.1", "port": port,
+                     "key": str(base_sshkey)}
+
+        if base_disk.exists() and base_vars.exists() and base_sshkey.exists():
+            log("using cached Omarchy base (instant overlay)")
+            cls._overlay_from_base(vm, base_disk, base_vars)
+            if run(qemu_omarchy_argv(vm, install=False)).returncode != 0:
+                raise CliError("qemu boot failed")
+            wait_ssh(vm, 300)
+            return
+
+        # First install: build the base.
+        log(f"no cached base for {base_key}; running the Omarchy installer "
+            "(~15-20 min, unattended)")
+        base_dir.mkdir(parents=True, exist_ok=True)
+        gen_vm_key(base_dir)                       # stable base key
+        pub = (base_dir / "id_ed25519.pub").read_text().strip()
+        build_cidata_iso(d / "cidata.iso", OMARCHY_USER,
+                         _passwd_hash(OMARCHY_PASSWORD), pub)
+        # fresh full disk (becomes the base) + fresh UEFI vars
+        if run(["qemu-img", "create", "-f", "qcow2", str(d / "disk.qcow2"),
+                vm["hd"]]).returncode != 0:
+            raise CliError("qemu-img create failed")
+        shutil.copy(ovmf_vars_tmpl, d / "OVMF_VARS.fd")
+        if run(qemu_omarchy_argv(vm, install=True)).returncode != 0:
+            raise CliError("qemu installer boot failed")
+        log("waiting for the unattended install to finish and reboot (SSH poll, "
+            "30 min deadline)")
+        wait_ssh(vm, 1800)                         # install auto-reboots; poll ssh
+        log("install complete; snapshotting the base for future new/reset")
+        _qmp_powerdown(vm)
+        shutil.copy(d / "disk.qcow2", base_disk)
+        shutil.copy(d / "OVMF_VARS.fd", base_vars)
+        # switch this run onto an overlay of the base so the base stays pristine
+        cls._overlay_from_base(vm, base_disk, base_vars)
+        if run(qemu_omarchy_argv(vm, install=False)).returncode != 0:
+            raise CliError("qemu boot failed")
+        wait_ssh(vm, 300)
+
+    @classmethod
+    def _overlay_from_base(cls, vm, base_disk, base_vars):
+        d = vm_dir(vm["name"])
+        (d / "disk.qcow2").unlink(missing_ok=True)
+        if run(["qemu-img", "create", "-f", "qcow2", "-b", str(base_disk),
+                "-F", "qcow2", str(d / "disk.qcow2")]).returncode != 0:
+            raise CliError("qemu-img overlay create failed")
+        shutil.copy(base_vars, d / "OVMF_VARS.fd")
+
+    is_running = QemuArchBackend.is_running
+
+    @classmethod
+    def start(cls, vm):
+        if run(qemu_omarchy_argv(vm, install=False)).returncode != 0:
+            raise CliError("qemu boot failed")
+        wait_ssh(vm, 300)
+
+    @classmethod
+    def stop(cls, vm):
+        _qmp_powerdown(vm)
+
+    @classmethod
+    def destroy(cls, vm):
+        _qemu_stop(vm, graceful=False)
+
+    @classmethod
+    def reset(cls, vm):
+        """Wipe the guest back to the cached base without reinstalling."""
+        _qmp_powerdown(vm)
+        base_dir = cache_dir("omarchy-base") / cls._base_key_for(vm)
+        base_disk, base_vars = base_dir / "base.qcow2", base_dir / "OVMF_VARS.fd"
+        if not base_disk.exists():
+            raise CliError("no cached base to reset from; run 'kora rm' + 'kora new'")
+        cls._overlay_from_base(vm, base_disk, base_vars)
+        if run(qemu_omarchy_argv(vm, install=False)).returncode != 0:
+            raise CliError("qemu boot failed")
+        wait_ssh(vm, 300)
+
+    @staticmethod
+    def _base_key_for(vm):
+        # the guest key path is <base_dir>/id_ed25519, so its parent name is
+        # the base key.
+        return Path(vm["ssh"]["key"]).parent.name
+
+    @classmethod
+    def vnc_url(cls, vm):
+        return f"vnc://127.0.0.1:{5900 + vm['qemu']['vnc_display']}"
+
+
+BACKENDS = {b.name: b for b in (TartBackend, QemuArchBackend,
+                                QemuCloudimgBackend, QemuOmarchyBackend)}
 
 
 def backend_name_for(os_name):
-    """Host-platform dispatch for local VMs."""
+    """Host-platform dispatch for local creation. On the KVM devbox (linux)
+    this resolves the real backend that boots the guest; on the Mac it decides
+    whether the OS can run locally at all."""
     if os_name not in CATALOG:
         raise CliError(f"unknown OS '{os_name}' (kora list shows the catalog)")
+    spec = CATALOG[os_name]
+    # OS with an explicit backend (omarchy) - runs only where that backend can
+    # (linux + /dev/kvm). On the Mac it's cloud-only.
+    if spec.get("backend"):
+        if HOST_OS != "linux" or not Path("/dev/kvm").exists():
+            raise CliError(f"'{os_name}' is cloud-only (needs x86 KVM); use: "
+                           f"kora new {os_name} --cloud")
+        return spec["backend"]
     if HOST_OS == "darwin":
-        return "tart" if CATALOG[os_name]["tart"] else "qemu-arch"
-    if CATALOG[os_name]["cloudimg"] is None:
+        return "tart" if spec["tart"] else "qemu-arch"
+    if spec["cloudimg"] is None:
         raise CliError(f"'{os_name}' only runs locally on an Apple Silicon Mac (tart)")
     return "qemu-cloudimg"
 
@@ -1744,16 +2086,45 @@ def box_status(profile):
     return state, out
 
 
-def ensure_devbox(profile, assume_yes):
+def _create_box(profile, instance_type):
+    argv = ["new", CLOUD_BOX, "--kvm", "--profile", profile,
+            "--plugins", CLOUD_BOX_PLUGINS]
+    if instance_type:
+        argv += ["--type", instance_type]
+    tdesc = f", {instance_type}" if instance_type else ""
+    log(f"creating devbox '{CLOUD_BOX}' (--kvm{tdesc}, plugins: {CLOUD_BOX_PLUGINS})")
+    if _cdb(*argv) != 0:
+        raise CliError("clouddevbox new failed")
+
+
+def ensure_devbox(profile, assume_yes, instance_type=None, fresh=False):
+    """Ensure the 'kvm' devbox is up. fresh=True (omarchy) requires a specific
+    instance_type and always uses a clean box: if one already exists it is
+    destroyed and recreated (confirmed unless --yes), because omarchy needs a
+    known size and a pristine host. fresh=False (amun) reuses the box as-is."""
     state, out = box_status(profile)
-    if state == "missing":
+    if fresh:
+        if state == "missing":
+            log(f"COST: {CLOUD_COST_LINE}")
+            if not confirm(f"create devbox '{CLOUD_BOX}' at {instance_type} "
+                           "(takes ~10 min)?", assume_yes):
+                raise CliError("aborted")
+            _create_box(profile, instance_type)
+        else:
+            log(f"an existing '{CLOUD_BOX}' devbox is {state}")
+            if not confirm(f"destroy it (loses anything on it) and recreate a "
+                           f"fresh {instance_type} for omarchy?", assume_yes):
+                raise CliError("aborted")
+            log(f"destroying '{CLOUD_BOX}'")
+            if _cdb("destroy", CLOUD_BOX, "--yes", "--profile", profile) != 0:
+                raise CliError("clouddevbox destroy failed")
+            log(f"COST: {CLOUD_COST_LINE}")
+            _create_box(profile, instance_type)
+    elif state == "missing":
         log(f"COST: {CLOUD_COST_LINE}")
         if not confirm(f"create devbox '{CLOUD_BOX}' (takes ~10 min)?", assume_yes):
             raise CliError("aborted")
-        log(f"creating devbox '{CLOUD_BOX}' (--kvm, plugins: {CLOUD_BOX_PLUGINS})")
-        if _cdb("new", CLOUD_BOX, "--kvm", "--profile", profile,
-                "--plugins", CLOUD_BOX_PLUGINS) != 0:
-            raise CliError("clouddevbox new failed")
+        _create_box(profile, instance_type)
     elif state == "stopped":
         log(f"starting devbox '{CLOUD_BOX}'")
         if _cdb("start", CLOUD_BOX, "--profile", profile) != 0:
@@ -1832,11 +2203,15 @@ def _cloud_profile(state):
 
 def cloud_new(args):
     _require_clouddevbox()
-    if args.os == "sequoia":
-        raise CliError("macOS guests cannot run in the cloud (tart/Apple Silicon only)")
+    spec = CATALOG[args.os]
+    if spec["tart"] and not spec["cloudimg"] and not spec.get("backend"):
+        # macOS-only guests (sequoia/tahoe) have no cloud story.
+        raise CliError(f"'{args.os}' cannot run in the cloud (tart/Apple Silicon only)")
     profile = resolve_profile(args.profile)
     log(f"cloud mode: devbox '{CLOUD_BOX}', profile {profile}")
-    ensure_devbox(profile, args.yes)
+    instance_type = spec.get("instance_type")
+    fresh = bool(spec.get("cloud_only"))   # omarchy: pristine box at its type
+    ensure_devbox(profile, args.yes, instance_type=instance_type, fresh=fresh)
     sha = ensure_remote_kora(profile)
     remote_args = ["new", args.os]
     for flag, val in (("--ram", args.ram), ("--cpu", args.cpu), ("--hd", args.hd)):
@@ -1915,12 +2290,16 @@ def cmd_new(args):
         return
     backend_name = backend_name_for(args.os)
     is_qemu = backend_name.startswith("qemu")
+    # omarchy is a full graphical desktop - give it more headroom by default.
+    d_ram, d_cpu, d_hd = ((OMARCHY_RAM, OMARCHY_CPU, OMARCHY_HD)
+                          if args.os == "omarchy"
+                          else (DEFAULT_QEMU_RAM, DEFAULT_QEMU_CPU, DEFAULT_QEMU_HD))
     vm = {
         "name": new_vm_name(args.os), "os": args.os, "backend": backend_name,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "ram": args.ram or (DEFAULT_QEMU_RAM if is_qemu else None),
-        "cpu": int(args.cpu) if args.cpu else (DEFAULT_QEMU_CPU if is_qemu else None),
-        "hd": args.hd or (DEFAULT_QEMU_HD if is_qemu else None),
+        "ram": args.ram or (d_ram if is_qemu else None),
+        "cpu": int(args.cpu) if args.cpu else (d_cpu if is_qemu else None),
+        "hd": args.hd or (d_hd if is_qemu else None),
     }
     if vm["ram"]:
         vm["ram"] = parse_size(vm["ram"], "--ram")[0]
@@ -2004,6 +2383,34 @@ def cmd_rm(args):
     log("VM removed")
 
 
+def cmd_reset(args):
+    """Return the VM to a clean state. Local: stop, wipe, restart. Cloud:
+    reset the nested guest ON the box - the EC2 devbox is never stopped."""
+    state = require_vm()
+    if cloud_state(state):
+        profile = _cloud_profile(state)
+        bstate, _ = box_status(profile)
+        if bstate != "running":
+            raise CliError(f"devbox '{CLOUD_BOX}' is {bstate}; start it first "
+                           f"(kora start) - reset does not touch the EC2 box")
+        _ensure_remote(state)
+        # The box keeps running; only the nested guest is reset.
+        sys.exit(proxy(profile, ["reset"]))
+    backend = backend_for(state)
+    resetter = getattr(backend, "reset", None)
+    if resetter is not None:
+        log(f"resetting {state['name']} ({state['backend']})")
+        resetter(state)
+    else:
+        # generic fallback: destroy + recreate (arch reinstalls - slow)
+        if state["backend"] == "qemu-arch":
+            log("note: arch has no cached base; reset reinstalls (~15 min)")
+        backend.destroy(state)
+        backend.create(state)
+    save_state(state)
+    log("VM reset")
+
+
 def cmd_status(args):
     if args.side == "cloud":
         return _status_cloud(args)
@@ -2078,7 +2485,10 @@ def cmd_list(args):
     have_cdb = shutil.which("clouddevbox") is not None
     print(f"{'OS':<10}{'LOCAL':<38}CLOUD")
     for os_name, spec in CATALOG.items():
-        if HOST_OS == "darwin":
+        cloud_only = spec.get("cloud_only")
+        if cloud_only:
+            local = "-- (cloud only)"
+        elif HOST_OS == "darwin":
             if spec["tart"]:
                 local = f"tart ({spec['tart'].split('/')[-1]})" if have_tart else \
                     "needs tart (brew install cirruslabs/cli/tart)"
@@ -2091,11 +2501,12 @@ def cmd_list(args):
                     "needs qemu-system-x86 + /dev/kvm"
             else:
                 local = "-- (Apple Silicon Mac only)"
-        if spec["cloudimg"] is None:
+        if spec["cloudimg"] is None and not cloud_only:
             cloud = "--"
         else:
-            cloud = f"qemu+kvm on devbox '{CLOUD_BOX}'" if have_cdb else \
-                "needs clouddevbox (gear)"
+            itype = spec.get("instance_type")
+            where = f"qemu+kvm on '{CLOUD_BOX}'" + (f" ({itype})" if itype else "")
+            cloud = where if have_cdb else "needs clouddevbox (gear)"
         print(f"{os_name:<10}{local:<38}{cloud}")
 
 
@@ -2261,6 +2672,10 @@ def build_parser():
 
     p = sub.add_parser("rm", help="delete the VM (disk + state)")
     p.set_defaults(fn=cmd_rm)
+
+    p = sub.add_parser("reset", help="wipe the VM back to clean (cloud: resets the "
+                                     "nested guest, never stops the devbox)")
+    p.set_defaults(fn=cmd_reset)
 
     p = sub.add_parser("cmd", help="run a command in the VM (single arg = shell string)")
     p.add_argument("command", nargs=argparse.REMAINDER)

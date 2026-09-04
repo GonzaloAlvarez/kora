@@ -270,3 +270,155 @@ def test_version(capsys):
         kora.main(["--version"])
     assert e.value.code == 0
     assert capsys.readouterr().out.strip() == f"kora {kora.VERSION}"
+
+
+# ---------------------------------------------------------------------------
+# omarchy (cloud-only ISO installer) + reset (v0.2.0)
+# ---------------------------------------------------------------------------
+OMARCHY_VM = {
+    "name": "kora-omarchy-abc123", "os": "omarchy", "backend": "qemu-omarchy",
+    "ram": "8G", "cpu": 4, "hd": "40G",
+    "ssh": {"user": "gonzalo", "host": "127.0.0.1", "port": 22350,
+            "key": "/cache/omarchy-base/aa-bb/id_ed25519"},
+    "qemu": {"ssh_port": 22350, "vnc_display": 22, "arch": "x86_64",
+             "ovmf_code": "/usr/share/OVMF/OVMF_CODE_4M.fd",
+             "iso": "/cache/omarchy/4.0.2/omarchy-4.0.2.iso",
+             "qmp_sock": "/tmp/vms/kora-omarchy-abc123/qmp.sock"},
+}
+
+
+def test_omarchy_catalog_shape():
+    o = kora.CATALOG["omarchy"]
+    assert o["tart"] is None and o["cloudimg"] is None
+    assert o["cloud_only"] and o["backend"] == "qemu-omarchy"
+    assert o["instance_type"] == "m7i.xlarge"
+    assert "{ver}" in o["iso"]
+
+
+def test_omarchy_backend_dispatch(monkeypatch):
+    # darwin: cloud-only, rejected locally
+    monkeypatch.setattr(kora, "HOST_OS", "darwin")
+    with pytest.raises(kora.CliError, match="cloud-only"):
+        kora.backend_name_for("omarchy")
+    # linux + /dev/kvm: resolves to the omarchy backend
+    monkeypatch.setattr(kora, "HOST_OS", "linux")
+    monkeypatch.setattr(kora.Path, "exists", lambda self: True)
+    assert kora.backend_name_for("omarchy") == "qemu-omarchy"
+
+
+def test_omarchy_iso_url(monkeypatch):
+    monkeypatch.setattr(kora, "OMARCHY_VERSION", "4.0.2")
+    assert kora.omarchy_iso_url() == "https://iso.omarchy.org/omarchy-4.0.2.iso"
+
+
+def test_omarchy_argv_run_vs_install(home):
+    run = " ".join(str(a) for a in kora.qemu_omarchy_argv(OMARCHY_VM, install=False))
+    assert "qemu-system-x86_64" in run and "q35,accel=kvm" in run and "-enable-kvm" in run
+    assert "if=pflash" in run and "OVMF_CODE_4M.fd" in run          # UEFI, not SeaBIOS
+    assert "virtio-blk-pci,drive=disk0,bootindex=1" in run
+    assert "virtio-vga" in run and "127.0.0.1:22" in run            # display for kora vnc
+    assert "hostfwd=tcp:127.0.0.1:22350-:22" in run                 # loopback-only
+    assert "usb-tablet" in run and "qmp" in run
+    assert "cidata" not in run and "media=cdrom" not in run         # no installer on run
+    inst = " ".join(str(a) for a in kora.qemu_omarchy_argv(OMARCHY_VM, install=True))
+    assert "omarchy-4.0.2.iso,media=cdrom" in inst
+    assert "ide-cd,drive=cd0,bootindex=2" in inst                   # ISO lower boot prio
+    assert "cidata.iso,media=cdrom" in inst and "ide-cd,drive=cd1" in inst
+
+
+def test_omarchy_cidata_render(tmp_path, monkeypatch):
+    monkeypatch.setattr(kora, "ensure_iso_tool", lambda: ["true"])
+    monkeypatch.setattr(kora, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0})())
+    iso = tmp_path / "cidata.iso"
+    key = kora.build_cidata_iso(iso, "gonzalo", "$6$deadbeef$hash",
+                                "ssh-ed25519 AAAA test")
+    staged = tmp_path / "cidata"
+    cfg = json.loads((staged / "user_configuration.json").read_text())
+    creds = json.loads((staged / "user_credentials.json").read_text())
+    ak = (staged / "authorized_keys").read_text()
+    # no LUKS: no disk_encryption block, no encrypt flag file
+    assert "disk_encryption" not in cfg
+    assert not (staged / "user_encrypt_installation.txt").exists()
+    # user gonzalo, sudo, installs to the virtio disk
+    assert creds["users"][0]["username"] == "gonzalo"
+    assert creds["users"][0]["sudo"] is True
+    assert creds["users"][0]["enc_password"] == "$6$deadbeef$hash"
+    assert cfg["disk_config"]["device_modifications"][0]["device"] == "/dev/vda"
+    assert "ssh-ed25519 AAAA test" in ak
+    assert isinstance(key, str) and len(key) == 12    # base cache key
+
+
+def test_omarchy_credentials_no_root():
+    c = kora.omarchy_user_credentials("gonzalo", "H")
+    assert c["root_enc_password"] is None
+    assert c["users"] == [{"username": "gonzalo", "enc_password": "H", "sudo": True}]
+
+
+def test_omarchy_defaults(monkeypatch, home):
+    # cmd_new (local path on a faked linux+kvm box) applies omarchy headroom
+    monkeypatch.setattr(kora, "HOST_OS", "linux")
+    monkeypatch.setattr(kora.Path, "exists", lambda self: True)
+    captured = {}
+    monkeypatch.setattr(kora.QemuOmarchyBackend, "create",
+                        classmethod(lambda cls, vm: captured.update(vm)))
+    monkeypatch.setattr(kora, "save_state", lambda vm: None)
+    kora.main(["new", "omarchy"])
+    assert captured["ram"] == "8G" and captured["cpu"] == 4 and captured["hd"] == "40G"
+
+
+def test_cmd_list_omarchy_row(monkeypatch, capsys):
+    monkeypatch.setattr(kora.shutil, "which", lambda x: "/usr/bin/" + x)
+    monkeypatch.setattr(kora.Path, "exists", lambda self: True)
+    kora.main(["list"])
+    out = capsys.readouterr().out
+    line = [ln for ln in out.splitlines() if ln.startswith("omarchy")][0]
+    assert "cloud only" in line and "m7i.xlarge" in line
+
+
+def test_ensure_devbox_fresh_recreates(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kora, "box_status", lambda p: ("running", ""))
+    monkeypatch.setattr(kora, "confirm", lambda *a, **k: True)
+    def fake_cdb(*argv, capture=False):
+        calls.append(argv)
+        if capture:
+            return (0, "fully provisioned", "")
+        return 0
+    monkeypatch.setattr(kora, "_cdb", fake_cdb)
+    kora.ensure_devbox("p", True, instance_type="m7i.xlarge", fresh=True)
+    # an existing box is destroyed then recreated at the requested type
+    assert ("destroy", "kvm", "--yes", "--profile", "p") in calls
+    newc = [c for c in calls if c[0] == "new"][0]
+    assert "--type" in newc and "m7i.xlarge" in newc and "--kvm" in newc
+
+
+def test_ensure_devbox_nonfresh_reuses(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kora, "box_status", lambda p: ("running", ""))
+    def fake_cdb(*argv, capture=False):
+        calls.append(argv)
+        return (0, "fully provisioned", "") if capture else 0
+    monkeypatch.setattr(kora, "_cdb", fake_cdb)
+    kora.ensure_devbox("p", True)          # amun path: reuse, never destroy
+    assert not any(c[0] in ("destroy", "new") for c in calls)
+
+
+def test_parser_reset():
+    args = kora.build_parser().parse_args(["reset"])
+    assert args.fn is kora.cmd_reset
+
+
+def test_reset_requires_vm(home):
+    with pytest.raises(kora.CliError, match="no VM exists"):
+        kora.main(["reset"])
+
+
+def test_reset_local_uses_backend_reset(home, monkeypatch):
+    kora.save_state(dict(OMARCHY_VM, backend="qemu-omarchy"))
+    done = {}
+    monkeypatch.setattr(kora.QemuOmarchyBackend, "reset",
+                        classmethod(lambda cls, vm: done.setdefault("reset", True)))
+    monkeypatch.setattr(kora, "save_state", lambda vm: None)
+    kora.main(["reset"])
+    assert done.get("reset")
