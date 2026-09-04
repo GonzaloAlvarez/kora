@@ -495,3 +495,11 @@ def test_resolve_profile_uses_out_file(monkeypatch, home):
         return type("R", (), {"returncode": 0, "stderr": ""})()
     monkeypatch.setattr(kora.subprocess, "run", fake_run)
     assert kora.resolve_profile(None) == "work"
+
+
+def test_vnc_login_hint_omarchy(capsys):
+    kora._vnc_login_hint({"os": "omarchy"})
+    out = capsys.readouterr().out
+    assert kora.OMARCHY_USER in out and kora.OMARCHY_PASSWORD in out
+    kora._vnc_login_hint({"os": "debian"})   # no hint for non-omarchy
+    assert capsys.readouterr().out == ""

@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -2752,6 +2752,14 @@ def _open_url(url):
         run(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _vnc_login_hint(state):
+    """The QEMU VNC server has no password; the desktop login/lock screen does.
+    Print the guest credentials so the operator knows what to type."""
+    if state["os"] == "omarchy":
+        print(f"desktop login: {OMARCHY_USER} / {OMARCHY_PASSWORD}  "
+              "(no VNC password - this is Omarchy's login/lock screen)")
+
+
 def cmd_vnc(args):
     state = require_vm()
     if cloud_state(state):
@@ -2759,6 +2767,7 @@ def cmd_vnc(args):
         hop, hop_port = cloud_tunnel(state, 5900 + disp)
         url = f"vnc://127.0.0.1:{hop_port}"
         print(url)
+        _vnc_login_hint(state)
         print("(tunnel held open - ctrl-c to close)")
         _open_url(url)
         try:
@@ -2775,6 +2784,7 @@ def cmd_vnc(args):
     if not url:
         raise CliError(f"no VNC URL yet - check {state.get('tart', {}).get('log', '?')}")
     print(url)
+    _vnc_login_hint(state)
     _open_url(url)
 
 
