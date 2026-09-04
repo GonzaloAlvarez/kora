@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -118,6 +118,9 @@ OMARCHY_CPU = 4
 OMARCHY_HD = "40G"
 SSH_PORT_RANGE = (22300, 22399)
 VNC_DISPLAY_RANGE = (10, 99)
+# VNC tunnels land here so the vnc:// URL is a real 59xx port every client
+# understands (not a number VNC viewers misread as a display offset).
+VNC_LOCAL_RANGE = (5901, 5999)
 
 TART_VM_USER = "admin"      # cirruslabs image convention
 TART_VM_PASSWORD = "admin"
@@ -2394,11 +2397,13 @@ def cloud_new(args):
     log("connect: kora ssh | run: kora cmd '<command>' | display: kora vnc")
 
 
-def cloud_tunnel(state, box_port):
+def cloud_tunnel(state, box_port, local_lo=None, local_hi=None):
     """clouddevbox tun for the mac->box hop, on a freshly allocated local
     port (a fixed port could collide with an unrelated local listener and
-    fake tunnel readiness). Returns (Popen, local_port)."""
-    local_port = alloc_port()
+    fake tunnel readiness). local_lo/hi pick the local port range - VNC uses
+    59xx so the vnc:// URL isn't misread as a display number. Returns
+    (Popen, local_port)."""
+    local_port = (alloc_port(local_lo, local_hi) if local_lo else alloc_port())
     argv = ["clouddevbox", "tun", CLOUD_BOX, str(local_port), str(box_port),
             "--profile", _cloud_profile(state)]
     p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2764,7 +2769,7 @@ def cmd_vnc(args):
     state = require_vm()
     if cloud_state(state):
         disp = state["cloud"]["guest_vnc_display"]
-        hop, hop_port = cloud_tunnel(state, 5900 + disp)
+        hop, hop_port = cloud_tunnel(state, 5900 + disp, *VNC_LOCAL_RANGE)
         url = f"vnc://127.0.0.1:{hop_port}"
         print(url)
         _vnc_login_hint(state)
