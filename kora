@@ -89,6 +89,7 @@ CATALOG = {
         "backend": "qemu-omarchy",
         "cloud_only": True,         # no local backend (Mac can't nest x86 KVM)
         "instance_type": "m7i.xlarge",
+        "long_install": True,       # ~15-40 min ISO install: run detached on the box
         "sve_fix": False,
     },
 }
@@ -1720,50 +1721,99 @@ def omarchy_iso_url():
     return CATALOG["omarchy"]["iso"].format(ver=OMARCHY_VERSION)
 
 
-def omarchy_user_configuration(hostname="omarchy"):
-    """archinstall config for an UNENCRYPTED unattended install to /dev/vda
-    (the guest's virtio-blk disk). No 'disk_encryption' block => no LUKS =>
-    fully unattended (no boot-time passphrase).
+# Fixed archinstall partition handles - any unique UUIDs work; keeping them
+# constant makes the config deterministic so the installed base caches by sha.
+_OMARCHY_BOOT_OBJ = "ea21d3f2-82bb-49cc-ab5d-6f81ae94e18d"
+_OMARCHY_ROOT_OBJ = "8c2c2b92-1070-455d-b76a-56263bab24aa"
 
-    WARNING: archinstall's config schema drifts between versions; these fields
-    must be validated against the archinstall bundled in the pinned Omarchy
-    ISO (Omarchy docs: run one interactive install and copy /root/*.json).
-    Keep this the single place to fix on a version bump."""
+
+def omarchy_user_configuration(disk_bytes=40 * 1024 ** 3, hostname="omarchy"):
+    """The exact archinstall+Omarchy config the Omarchy 4 Configurator writes
+    for a full-disk UNENCRYPTED install to the virtio /dev/vda disk (verbatim
+    from omacom/omarchy-iso test/integration.d/base-test.sh: Limine bootloader,
+    btrfs subvolumes, byte-precise partitions). No disk_encryption block, plus
+    user_encrypt_installation.txt="false", => no LUKS => fully unattended.
+    Deterministic (fixed obj_ids/hostname) so the base caches by config sha.
+
+    This is the single schema-sensitive spot: on an Omarchy version bump,
+    re-capture from the ISO's Configurator (or that integration test)."""
+    mib, gib = 1024 ** 2, 1024 ** 3
+    boot_start, boot_size = mib, 2 * gib
+    main_start = boot_start + boot_size
+    main_size = disk_bytes - main_start - mib
+
+    def sz(value):
+        return {"sector_size": {"unit": "B", "value": 512}, "unit": "B", "value": value}
+
     return {
-        "archinstall-language": "English (United States)",
-        "bootloader": "Systemd-boot",
-        "hostname": hostname,
-        "kernels": ["linux"],
-        "locale_config": {"kb_layout": "us", "sys_enc": "UTF-8", "sys_lang": "en_US"},
-        "timezone": "UTC",
-        "ntp": True,
-        "swap": True,
+        "app_config": None,
+        "archinstall-language": "English",
+        "auth_config": {},
+        "audio_config": {"audio": "pipewire"},
+        "bootloader_config": {"bootloader": "Limine", "uki": False, "removable": False},
+        "custom_commands": [],
+        "omarchy_install": {
+            "mode": "full_disk", "defer_provisioning": False, "target_mount": "/mnt",
+            "boot": {"esp_mount": "/boot", "esp_path": "/EFI/limine",
+                     "efi_binary": "limine_x64.efi", "enable_fallback": True},
+            "storage": {"kernel": "linux"},
+        },
         "disk_config": {
             "config_type": "default_layout",
             "device_modifications": [{
-                "device": "/dev/vda",
-                "wipe": True,
+                "device": "/dev/vda", "wipe": True,
                 "partitions": [
-                    {"type": "primary", "status": "create",
-                     "flags": ["boot", "esp"], "fs_type": "fat32",
-                     "mountpoint": "/boot",
-                     "start": {"unit": "MiB", "value": 1},
-                     "size": {"unit": "MiB", "value": 1024}},
-                    {"type": "primary", "status": "create",
-                     "fs_type": "ext4", "mountpoint": "/",
-                     "start": {"unit": "MiB", "value": 1025},
-                     "size": {"unit": "Percent", "value": 100}},
+                    {"btrfs": [], "dev_path": None, "flags": ["boot", "esp"],
+                     "fs_type": "fat32", "mount_options": [], "mountpoint": "/boot",
+                     "obj_id": _OMARCHY_BOOT_OBJ,
+                     "size": sz(boot_size), "start": sz(boot_start),
+                     "status": "create", "type": "primary"},
+                    {"btrfs": [{"mountpoint": "/", "name": "@"},
+                               {"mountpoint": "/home", "name": "@home"},
+                               {"mountpoint": "/var/log", "name": "@log"},
+                               {"mountpoint": "/var/cache/pacman/pkg", "name": "@pkg"}],
+                     "dev_path": None, "flags": [], "fs_type": "btrfs",
+                     "mount_options": ["compress=zstd"], "mountpoint": None,
+                     "obj_id": _OMARCHY_ROOT_OBJ,
+                     "size": sz(main_size), "start": sz(main_start),
+                     "status": "create", "type": "primary"},
                 ],
             }],
         },
+        "hostname": hostname,
+        "kernels": ["linux"],
+        "network_config": {"type": "iso"},
+        "ntp": True,
+        "parallel_downloads": 8,
+        "script": None,
+        "services": [],
+        "swap": True,
+        "timezone": "UTC",
+        "locale_config": {"kb_layout": "us", "sys_enc": "UTF-8",
+                          "sys_lang": "en_US.UTF-8"},
+        "mirror_config": {
+            "custom_repositories": [],
+            "custom_servers": [
+                {"url": "https://mirror.omarchy.org/$repo/os/$arch"},
+                {"url": "https://mirror.rackspace.com/archlinux/$repo/os/$arch"},
+                {"url": "https://geo.mirror.pkgbuild.com/$repo/os/$arch"},
+            ],
+            "mirror_regions": {},
+            "optional_repositories": [],
+        },
+        "packages": ["base-devel", "git", "omarchy-keyring",
+                     "omarchy-settings", "omarchy"],
+        "profile_config": {"gfx_driver": None, "greeter": None, "profile": {}},
+        "version": "3.0.9",
     }
 
 
 def omarchy_user_credentials(username, password_hash):
-    """archinstall credentials: one sudo user, no root password."""
+    """archinstall credentials: one sudo user + a root password (same hash)."""
     return {
-        "users": [{"username": username, "enc_password": password_hash, "sudo": True}],
-        "root_enc_password": None,
+        "root_enc_password": password_hash,
+        "users": [{"enc_password": password_hash, "groups": [], "sudo": True,
+                   "username": username}],
     }
 
 
@@ -1774,20 +1824,25 @@ def _passwd_hash(pw):
     return out.strip().splitlines()[-1].strip()
 
 
-def build_cidata_iso(dest_iso, username, password_hash, pubkey):
-    """Write the three cidata files and pack them into a NoCloud-labeled ISO
-    (label 'cidata'). Returns the config-layout sha that keys the cached base
-    (independent of the per-install key/password so the base is reusable)."""
+def build_cidata_iso(dest_iso, username, password_hash, pubkey, disk_bytes):
+    """Write the cidata files and pack them into a NoCloud-labeled ISO (label
+    'cidata'; the Omarchy installer detects it and skips the wizard). Returns
+    the config-layout sha that keys the cached base (independent of the
+    per-install key/password so the base stays reusable)."""
     staged = dest_iso.parent / "cidata"
     if staged.exists():
         shutil.rmtree(staged)
     staged.mkdir(parents=True)
-    config = omarchy_user_configuration()
-    (staged / "user_configuration.json").write_text(json.dumps(config, indent=2))
+    config = omarchy_user_configuration(disk_bytes)
+    (staged / "user_configuration.json").write_text(json.dumps(config, indent=4))
     (staged / "user_credentials.json").write_text(
-        json.dumps(omarchy_user_credentials(username, password_hash), indent=2))
+        json.dumps(omarchy_user_credentials(username, password_hash), indent=4))
     (staged / "authorized_keys").write_text(pubkey.strip() + "\n")
-    # No user_encrypt_installation.txt and no disk_encryption block => no LUKS.
+    (staged / "user_full_name.txt").write_text("Gonzalo Alvarez\n")
+    (staged / "user_email_address.txt").write_text("gonzaloab@gmail.com\n")
+    # "false" (not omitted) + no disk_encryption block => unencrypted, no
+    # boot-time LUKS passphrase => fully unattended.
+    (staged / "user_encrypt_installation.txt").write_text("false\n")
     tool = ensure_iso_tool()
     if run([*tool, "-output", str(dest_iso), "-volid", "cidata", "-joliet",
             "-rock", str(staged)],
@@ -1817,11 +1872,14 @@ def qemu_omarchy_argv(vm, install=False):
         "-qmp", f"unix:{q['qmp_sock']},server=on,wait=off",
     ]
     if install:
+        # ISO on ide-cd (lower boot priority than the disk), cidata as a
+        # usb-storage drive - matches omacom/omarchy-iso's own test harness;
+        # the installer finds cidata by its filesystem label, not the bus.
         argv += [
-            "-drive", f"file={q['iso']},media=cdrom,if=none,format=raw,id=cd0",
-            "-device", "ide-cd,drive=cd0,bootindex=2",
-            "-drive", f"file={d / 'cidata.iso'},media=cdrom,if=none,format=raw,id=cd1",
-            "-device", "ide-cd,drive=cd1",
+            "-drive", f"file={q['iso']},media=cdrom,if=none,format=raw,id=cdrom0",
+            "-device", "ide-cd,drive=cdrom0,bootindex=2",
+            "-drive", f"file={d / 'cidata.iso'},format=raw,if=none,id=cidata",
+            "-device", "usb-storage,drive=cidata",
         ]
     return argv + qemu_common_argv(vm, 22)
 
@@ -1893,9 +1951,10 @@ class QemuOmarchyBackend:
         # per-install password/key). The base install bakes in a STABLE key
         # (below) so cached-base overlays stay ssh-reachable across new/reset
         # with no re-keying.
+        disk_bytes = parse_size(vm["hd"], "--hd")[1] * 1024 * 1024
         iso_sha = sha256_file(iso)[:12]
         cfg_sha = hashlib.sha256(
-            json.dumps(omarchy_user_configuration(), sort_keys=True).encode()
+            json.dumps(omarchy_user_configuration(disk_bytes), sort_keys=True).encode()
         ).hexdigest()[:12]
         base_key = f"{iso_sha}-{cfg_sha}"
         base_dir = cache_dir("omarchy-base") / base_key
@@ -1920,7 +1979,7 @@ class QemuOmarchyBackend:
         gen_vm_key(base_dir)                       # stable base key
         pub = (base_dir / "id_ed25519.pub").read_text().strip()
         build_cidata_iso(d / "cidata.iso", OMARCHY_USER,
-                         _passwd_hash(OMARCHY_PASSWORD), pub)
+                         _passwd_hash(OMARCHY_PASSWORD), pub, disk_bytes)
         # fresh full disk (becomes the base) + fresh UEFI vars
         if run(["qemu-img", "create", "-f", "qcow2", str(d / "disk.qcow2"),
                 vm["hd"]]).returncode != 0:
@@ -1929,8 +1988,8 @@ class QemuOmarchyBackend:
         if run(qemu_omarchy_argv(vm, install=True)).returncode != 0:
             raise CliError("qemu installer boot failed")
         log("waiting for the unattended install to finish and reboot (SSH poll, "
-            "30 min deadline)")
-        wait_ssh(vm, 1800)                         # install auto-reboots; poll ssh
+            "40 min deadline)")
+        wait_ssh(vm, 2400)                         # install auto-reboots; poll ssh
         log("install complete; snapshotting the base for future new/reset")
         _qmp_powerdown(vm)
         shutil.copy(d / "disk.qcow2", base_disk)
@@ -2193,6 +2252,47 @@ def remote_status_json(profile):
         raise CliError(f"unparseable remote status:\n{out}")
 
 
+def cloud_new_detached(profile, new_args):
+    """Run a long box-side install (omarchy) detached so it survives an SSH
+    drop, then poll marker files until it finishes. Progress is heartbeated
+    from the box-side log tail."""
+    argstr = " ".join(shlex.quote(a) for a in new_args)
+    # setsid+nohup detaches from the ssh session's process group so a dropped
+    # session can't SIGHUP the install. Markers report terminal state.
+    launch = ("rm -f ~/kora-install.done ~/kora-install.failed; "
+              "setsid nohup sh -c " + shlex.quote(
+                  f"~/bin/kora {argstr} && touch ~/kora-install.done "
+                  f"|| touch ~/kora-install.failed") +
+              " >~/kora-install.log 2>&1 & echo launched")
+    if _cdb("ssh", CLOUD_BOX, "--profile", profile, "--", launch) != 0:
+        raise CliError("failed to launch the box-side install")
+    log("omarchy install running on the box (detached; survives SSH drops) - "
+        "full unattended install, ~15-40 min")
+    deadline = time.time() + 3300          # 55 min
+    last_beat = 0
+    probe = ("if [ -f ~/kora-install.done ]; then echo DONE; "
+             "elif [ -f ~/kora-install.failed ]; then echo FAILED; "
+             "else echo RUNNING; fi; tail -n 1 ~/kora-install.log 2>/dev/null")
+    while time.time() < deadline:
+        time.sleep(30)
+        _, out, _ = _cdb("ssh", CLOUD_BOX, "--profile", profile, "--", probe,
+                         capture=True)
+        lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+        stateword = lines[0].strip() if lines else "RUNNING"
+        tail = lines[-1].strip() if len(lines) > 1 else ""
+        if stateword == "DONE":
+            log("box-side install finished")
+            return
+        if stateword == "FAILED":
+            _, logtail, _ = _cdb("ssh", CLOUD_BOX, "--profile", profile, "--",
+                                 "tail -n 30 ~/kora-install.log", capture=True)
+            raise CliError(f"omarchy install failed on the box:\n{logtail}")
+        if time.time() - last_beat > 120:
+            log(f"  still installing... {tail[:100]}")
+            last_beat = time.time()
+    raise CliError("omarchy install timed out (55 min)")
+
+
 def cloud_state(state):
     return state is not None and state["backend"] == "cloud"
 
@@ -2213,13 +2313,17 @@ def cloud_new(args):
     fresh = bool(spec.get("cloud_only"))   # omarchy: pristine box at its type
     ensure_devbox(profile, args.yes, instance_type=instance_type, fresh=fresh)
     sha = ensure_remote_kora(profile)
-    remote_args = ["new", args.os]
+    new_args = ["new", args.os]
     for flag, val in (("--ram", args.ram), ("--cpu", args.cpu), ("--hd", args.hd)):
         if val:
-            remote_args += [flag, str(val)]
+            new_args += [flag, str(val)]
     if args.force:
-        remote_args.append("--force")
-    if proxy(profile, remote_args) != 0:
+        new_args.append("--force")
+    if spec.get("long_install"):
+        # A ~15-40 min unattended install can't ride a single foreground SSH
+        # session safely - run it detached on the box and poll for completion.
+        cloud_new_detached(profile, new_args)
+    elif proxy(profile, new_args) != 0:
         raise CliError("remote kora new failed")
     remote = remote_status_json(profile)
     rvm = remote["vm"]

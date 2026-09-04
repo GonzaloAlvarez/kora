@@ -322,8 +322,8 @@ def test_omarchy_argv_run_vs_install(home):
     assert "cidata" not in run and "media=cdrom" not in run         # no installer on run
     inst = " ".join(str(a) for a in kora.qemu_omarchy_argv(OMARCHY_VM, install=True))
     assert "omarchy-4.0.2.iso,media=cdrom" in inst
-    assert "ide-cd,drive=cd0,bootindex=2" in inst                   # ISO lower boot prio
-    assert "cidata.iso,media=cdrom" in inst and "ide-cd,drive=cd1" in inst
+    assert "ide-cd,drive=cdrom0,bootindex=2" in inst                # ISO lower boot prio
+    assert "cidata.iso,format=raw" in inst and "usb-storage,drive=cidata" in inst
 
 
 def test_omarchy_cidata_render(tmp_path, monkeypatch):
@@ -332,27 +332,44 @@ def test_omarchy_cidata_render(tmp_path, monkeypatch):
                         lambda *a, **k: type("R", (), {"returncode": 0})())
     iso = tmp_path / "cidata.iso"
     key = kora.build_cidata_iso(iso, "gonzalo", "$6$deadbeef$hash",
-                                "ssh-ed25519 AAAA test")
+                                "ssh-ed25519 AAAA test", 40 * 1024 ** 3)
     staged = tmp_path / "cidata"
     cfg = json.loads((staged / "user_configuration.json").read_text())
     creds = json.loads((staged / "user_credentials.json").read_text())
     ak = (staged / "authorized_keys").read_text()
-    # no LUKS: no disk_encryption block, no encrypt flag file
+    # no LUKS: no disk_encryption block, and the encrypt flag is "false"
     assert "disk_encryption" not in cfg
-    assert not (staged / "user_encrypt_installation.txt").exists()
-    # user gonzalo, sudo, installs to the virtio disk
+    assert (staged / "user_encrypt_installation.txt").read_text().strip() == "false"
+    # user gonzalo, sudo, installs to the virtio disk with Omarchy's Limine + btrfs
     assert creds["users"][0]["username"] == "gonzalo"
     assert creds["users"][0]["sudo"] is True
     assert creds["users"][0]["enc_password"] == "$6$deadbeef$hash"
-    assert cfg["disk_config"]["device_modifications"][0]["device"] == "/dev/vda"
+    assert cfg["bootloader_config"]["bootloader"] == "Limine"
+    assert cfg["omarchy_install"]["mode"] == "full_disk"
+    dev = cfg["disk_config"]["device_modifications"][0]
+    assert dev["device"] == "/dev/vda"
+    assert dev["partitions"][1]["fs_type"] == "btrfs"
     assert "ssh-ed25519 AAAA test" in ak
     assert isinstance(key, str) and len(key) == 12    # base cache key
 
 
-def test_omarchy_credentials_no_root():
+def test_omarchy_credentials_root_and_groups():
     c = kora.omarchy_user_credentials("gonzalo", "H")
-    assert c["root_enc_password"] is None
-    assert c["users"] == [{"username": "gonzalo", "enc_password": "H", "sudo": True}]
+    assert c["root_enc_password"] == "H"
+    assert c["users"] == [{"enc_password": "H", "groups": [], "sudo": True,
+                           "username": "gonzalo"}]
+
+
+def test_omarchy_config_deterministic():
+    # same disk size => byte-identical config => stable base cache key
+    a = json.dumps(kora.omarchy_user_configuration(40 * 1024 ** 3), sort_keys=True)
+    b = json.dumps(kora.omarchy_user_configuration(40 * 1024 ** 3), sort_keys=True)
+    assert a == b
+    # partition sizes are byte integers derived from the disk size
+    cfg = kora.omarchy_user_configuration(40 * 1024 ** 3)
+    parts = cfg["disk_config"]["device_modifications"][0]["partitions"]
+    assert parts[0]["size"]["value"] == 2 * 1024 ** 3            # 2 GiB ESP
+    assert parts[1]["size"]["value"] == 40 * 1024 ** 3 - 2 * 1024 ** 3 - 2 * 1024 ** 2
 
 
 def test_omarchy_defaults(monkeypatch, home):
