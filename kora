@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -2088,22 +2088,29 @@ def _require_clouddevbox():
 
 
 def resolve_profile(cli_profile):
-    """Delegate AWS profile selection to clouddevbox. `clouddevbox profile`
-    (>= 1.7.1) draws its picker on the terminal (stderr) and prints ONLY the
-    chosen name to stdout, so we capture stdout while leaving stdin+stderr on
-    the tty - the menu is usable and the answer is clean. (A pty would merge
-    the menu redraw frames into the captured stream.)"""
+    """Delegate AWS profile selection to clouddevbox. bullet's picker draws on
+    stdout and binds that stream at import, so it can't be captured without
+    swallowing the menu (or, if stdout is a pipe, hanging invisibly). Instead
+    run `clouddevbox profile --out <file>` with ALL stdio inherited so the
+    menu is fully usable on the terminal, and read the answer back from the
+    file. Requires clouddevbox >= 1.7.2."""
     if cli_profile:
         return cli_profile
     _require_clouddevbox()
-    p = subprocess.run(["clouddevbox", "profile"], stdout=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise CliError("clouddevbox profile selection failed; pass --profile <p>")
-    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
-    profile = lines[-1] if lines else ""
+    out = kora_home() / "tmp"
+    out.mkdir(mode=0o700, exist_ok=True)
+    out_file = out / f"profile-{os.getpid()}"
+    out_file.unlink(missing_ok=True)
+    try:
+        rc = subprocess.run(["clouddevbox", "profile", "--out", str(out_file)]).returncode
+        if rc != 0:
+            raise CliError("clouddevbox profile selection failed; pass --profile <p>")
+        profile = out_file.read_text().strip() if out_file.exists() else ""
+    finally:
+        out_file.unlink(missing_ok=True)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", profile or ""):
-        raise CliError(f"could not parse the selected profile ({profile!r}); "
-                       "pass --profile <p>")
+        raise CliError(f"could not resolve a profile (got {profile!r}); "
+                       "pass --profile <p> or upgrade clouddevbox (>= 1.7.2)")
     return profile
 
 
