@@ -1442,6 +1442,20 @@ class QemuArchBackend:
         if run(qemu_arch_argv(vm)).returncode != 0:
             raise CliError("qemu boot failed")
         wait_ssh(vm, 300)
+        cls._fix_locale(vm)
+
+    @classmethod
+    def _fix_locale(cls, vm):
+        # The archboot installer generates en_US.UTF-8 for the installed
+        # system via `systemd-nspawn ... locale-gen`, but that step swallows
+        # its errors and doesn't reliably take - so an ssh session (which
+        # forwards the client's LANG=en_US.UTF-8) spews
+        # "setlocale: cannot change locale" warnings and locale-sensitive
+        # tools misbehave. Regenerate it in the real booted system, where
+        # locale-gen always works. Idempotent.
+        log("ensuring en_US.UTF-8 locale is generated")
+        vm_ssh(vm, "sudo sed -i 's/^#\\(en_US.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen "
+                   "&& sudo locale-gen", quiet=True)
 
     @classmethod
     def _serial_netfix(cls, vm, timeout=300):
