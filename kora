@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -2087,37 +2087,20 @@ def _require_clouddevbox():
                        "~/.gear/com/clouddevbox/setup-darwin (repo: cn-cli-devbox)")
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
-
-
 def resolve_profile(cli_profile):
-    """Delegate AWS profile selection to clouddevbox (bullet picker on a tty).
-    Runs `clouddevbox profile` under a pty so the interactive menu still
-    renders while kora captures the chosen name (the last stdout line)."""
+    """Delegate AWS profile selection to clouddevbox. `clouddevbox profile`
+    (>= 1.7.1) draws its picker on the terminal (stderr) and prints ONLY the
+    chosen name to stdout, so we capture stdout while leaving stdin+stderr on
+    the tty - the menu is usable and the answer is clean. (A pty would merge
+    the menu redraw frames into the captured stream.)"""
     if cli_profile:
         return cli_profile
     _require_clouddevbox()
-    if sys.stdin.isatty():
-        import pty
-        chunks = []
-
-        def _read(fd):
-            data = os.read(fd, 1024)
-            chunks.append(data)
-            return data
-
-        status = pty.spawn(["clouddevbox", "profile"], _read)
-        text = ANSI_RE.sub("", b"".join(chunks).decode(errors="replace"))
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if (status and os.waitstatus_to_exitcode(status) != 0) or not lines:
-            raise CliError("clouddevbox profile selection failed")
-        profile = lines[-1]
-    else:
-        rc, out, err = run_out(["clouddevbox", "profile"])
-        if rc != 0:
-            raise CliError("profile resolution failed (non-tty): pass --profile <p>\n"
-                           + err.strip())
-        profile = out.strip().splitlines()[-1] if out.strip() else ""
+    p = subprocess.run(["clouddevbox", "profile"], stdout=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise CliError("clouddevbox profile selection failed; pass --profile <p>")
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    profile = lines[-1] if lines else ""
     if not re.fullmatch(r"[A-Za-z0-9._-]+", profile or ""):
         raise CliError(f"could not parse the selected profile ({profile!r}); "
                        "pass --profile <p>")
