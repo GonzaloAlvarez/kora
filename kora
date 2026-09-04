@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -2193,6 +2193,12 @@ def box_status(profile):
     return state, out
 
 
+def box_instance_type(status_out):
+    """The EC2 type from a `clouddevbox status` line: 'instance: i-.. (m7i.xlarge) - ..'."""
+    m = re.search(r"instance:\s+\S+\s+\(([^)]+)\)", status_out)
+    return m.group(1) if m else None
+
+
 def _create_box(profile, instance_type):
     argv = ["new", CLOUD_BOX, "--kvm", "--profile", profile,
             "--plugins", CLOUD_BOX_PLUGINS]
@@ -2206,19 +2212,28 @@ def _create_box(profile, instance_type):
 
 def ensure_devbox(profile, assume_yes, instance_type=None, fresh=False):
     """Ensure the 'kvm' devbox is up. fresh=True (omarchy) requires a specific
-    instance_type and always uses a clean box: if one already exists it is
-    destroyed and recreated (confirmed unless --yes), because omarchy needs a
-    known size and a pristine host. fresh=False (amun) reuses the box as-is."""
+    instance_type: a box already AT that type is reused (started if stopped) so
+    the cached Omarchy base survives for fast new/reset; only a wrong-sized (or
+    absent) box is created/destroyed+recreated. Confirmed unless --yes.
+    fresh=False (amun) reuses whatever box exists as-is."""
     state, out = box_status(profile)
     if fresh:
+        cur_type = box_instance_type(out) if state != "missing" else None
         if state == "missing":
             log(f"COST: {CLOUD_COST_LINE}")
             if not confirm(f"create devbox '{CLOUD_BOX}' at {instance_type} "
                            "(takes ~10 min)?", assume_yes):
                 raise CliError("aborted")
             _create_box(profile, instance_type)
+        elif cur_type == instance_type:
+            # right size - reuse it (keeps the cached base); just start if down
+            log(f"reusing the existing {instance_type} '{CLOUD_BOX}' devbox ({state})")
+            if state == "stopped":
+                if _cdb("start", CLOUD_BOX, "--profile", profile) != 0:
+                    raise CliError("clouddevbox start failed")
         else:
-            log(f"an existing '{CLOUD_BOX}' devbox is {state}")
+            log(f"an existing '{CLOUD_BOX}' devbox is {state} at {cur_type or '?'}, "
+                f"not {instance_type}")
             if not confirm(f"destroy it (loses anything on it) and recreate a "
                            f"fresh {instance_type} for omarchy?", assume_yes):
                 raise CliError("aborted")
@@ -2365,7 +2380,9 @@ def cloud_new(args):
     for flag, val in (("--ram", args.ram), ("--cpu", args.cpu), ("--hd", args.hd)):
         if val:
             new_args += [flag, str(val)]
-    if args.force:
+    # A reused box may carry a stale guest; cloud_only guests are always
+    # rebuilt from the cached base, so force past any existing one.
+    if args.force or spec.get("cloud_only"):
         new_args.append("--force")
     if spec.get("long_install"):
         # A ~15-40 min unattended install can't ride a single foreground SSH

@@ -503,3 +503,39 @@ def test_vnc_login_hint_omarchy(capsys):
     assert kora.OMARCHY_USER in out and kora.OMARCHY_PASSWORD in out
     kora._vnc_login_hint({"os": "debian"})   # no hint for non-omarchy
     assert capsys.readouterr().out == ""
+
+
+def test_box_instance_type_parse():
+    out = "instance:  i-09d5e1812b4260575 (m7i.xlarge) - running\nkvm: enabled\n"
+    assert kora.box_instance_type(out) == "m7i.xlarge"
+    assert kora.box_instance_type("no instance line") is None
+
+
+def test_ensure_devbox_fresh_reuses_right_size(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kora, "box_status", lambda p:
+                        ("stopped", "instance: i-x (m7i.xlarge) - stopped"))
+    def fake_cdb(*argv, capture=False):
+        calls.append(argv)
+        return (0, "fully provisioned", "") if capture else 0
+    monkeypatch.setattr(kora, "_cdb", fake_cdb)
+    kora.ensure_devbox("p", True, instance_type="m7i.xlarge", fresh=True)
+    # right-sized stopped box: started, never destroyed/recreated
+    assert any(c[0] == "start" for c in calls)
+    assert not any(c[0] in ("destroy", "new") for c in calls)
+
+
+def test_ensure_devbox_fresh_recreates_wrong_size(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kora, "box_status", lambda p:
+                        ("running", "instance: i-x (m7i.large) - running"))
+    monkeypatch.setattr(kora, "confirm", lambda *a, **k: True)
+    def fake_cdb(*argv, capture=False):
+        calls.append(argv)
+        return (0, "fully provisioned", "") if capture else 0
+    monkeypatch.setattr(kora, "_cdb", fake_cdb)
+    kora.ensure_devbox("p", True, instance_type="m7i.xlarge", fresh=True)
+    # wrong size: destroy + recreate at the right type
+    assert any(c[0] == "destroy" for c in calls)
+    newc = [c for c in calls if c[0] == "new"][0]
+    assert "m7i.xlarge" in newc
