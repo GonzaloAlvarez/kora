@@ -439,3 +439,59 @@ def test_reset_local_uses_backend_reset(home, monkeypatch):
     monkeypatch.setattr(kora, "save_state", lambda vm: None)
     kora.main(["reset"])
     assert done.get("reset")
+
+
+# ---------------------------------------------------------------------------
+# profile resolution: clouddevbox delegation + native fallback (v0.2.3)
+# ---------------------------------------------------------------------------
+def test_resolve_profile_passthrough_still_works():
+    assert kora.resolve_profile("given") == "given"
+
+
+def test_aws_profiles_parse(tmp_path, monkeypatch):
+    aws = tmp_path / ".aws"
+    aws.mkdir()
+    (aws / "config").write_text(
+        "[profile work]\nregion=us-east-2\n[profile personal]\nregion=us-west-2\n")
+    (aws / "credentials").write_text("[personal]\naws_access_key_id=x\n[extra]\nk=v\n")
+    monkeypatch.setattr(kora.Path, "home", staticmethod(lambda: tmp_path))
+    got = kora._aws_profiles()
+    assert got[:2] == ["work", "personal"]      # config order, 'profile ' stripped
+    assert "extra" in got and got.count("personal") == 1   # deduped across files
+
+
+def test_native_pick_single_auto(monkeypatch):
+    monkeypatch.setattr(kora, "_aws_profiles", lambda: ["only"])
+    assert kora._pick_profile_native() == "only"
+
+
+def test_native_pick_none_errors(monkeypatch):
+    monkeypatch.setattr(kora, "_aws_profiles", lambda: [])
+    with pytest.raises(kora.CliError, match="no AWS profiles"):
+        kora._pick_profile_native()
+
+
+def test_resolve_profile_falls_back_on_old_clouddevbox(monkeypatch, home):
+    """An old clouddevbox (no --out) -> kora's native picker, never a crash."""
+    monkeypatch.setattr(kora.shutil, "which", lambda x: "/usr/bin/" + x)
+
+    def fake_run(argv, **kw):
+        # simulate argparse rejecting --out
+        return type("R", (), {"returncode": 2,
+                              "stderr": "clouddevbox: error: unrecognized "
+                                        "arguments: --out /x"})()
+    monkeypatch.setattr(kora.subprocess, "run", fake_run)
+    monkeypatch.setattr(kora, "_pick_profile_native", lambda: "personal")
+    assert kora.resolve_profile(None) == "personal"
+
+
+def test_resolve_profile_uses_out_file(monkeypatch, home):
+    monkeypatch.setattr(kora.shutil, "which", lambda x: "/usr/bin/" + x)
+
+    def fake_run(argv, **kw):
+        # simulate clouddevbox 1.7.2 writing the chosen name to --out
+        out = argv[argv.index("--out") + 1]
+        Path(out).write_text("work\n")
+        return type("R", (), {"returncode": 0, "stderr": ""})()
+    monkeypatch.setattr(kora.subprocess, "run", fake_run)
+    assert kora.resolve_profile(None) == "work"

@@ -34,7 +34,7 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
 
@@ -2087,13 +2087,59 @@ def _require_clouddevbox():
                        "~/.gear/com/clouddevbox/setup-darwin (repo: cn-cli-devbox)")
 
 
+def _aws_profiles():
+    """Profile names from ~/.aws/config + ~/.aws/credentials (stdlib only)."""
+    import configparser
+    names, seen = [], set()
+    for path in (Path.home() / ".aws" / "config",
+                 Path.home() / ".aws" / "credentials"):
+        if not path.exists():
+            continue
+        cp = configparser.ConfigParser()
+        try:
+            cp.read(path)
+        except configparser.Error:
+            continue
+        for sec in cp.sections():
+            name = sec[len("profile "):] if sec.startswith("profile ") else sec
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _pick_profile_native():
+    """kora's own numbered picker - the fallback when clouddevbox is too old to
+    delegate to. Prompts on stderr so stdout stays clean."""
+    profs = _aws_profiles()
+    if not profs:
+        raise CliError("no AWS profiles in ~/.aws/config or ~/.aws/credentials; "
+                       "pass --profile <p>")
+    if len(profs) == 1:
+        return profs[0]
+    if not sys.stdin.isatty():
+        raise CliError("--profile is required when stdin is not a tty")
+    sys.stderr.write("Select AWS profile:\n")
+    for i, p in enumerate(profs, 1):
+        sys.stderr.write(f"  {i}) {p}\n")
+    while True:
+        sys.stderr.write("profile #: ")
+        sys.stderr.flush()
+        raw = sys.stdin.readline()
+        if not raw:
+            raise CliError("no selection; pass --profile <p>")
+        raw = raw.strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(profs):
+            return profs[int(raw) - 1]
+        sys.stderr.write("invalid choice\n")
+
+
 def resolve_profile(cli_profile):
-    """Delegate AWS profile selection to clouddevbox. bullet's picker draws on
-    stdout and binds that stream at import, so it can't be captured without
-    swallowing the menu (or, if stdout is a pipe, hanging invisibly). Instead
-    run `clouddevbox profile --out <file>` with ALL stdio inherited so the
-    menu is fully usable on the terminal, and read the answer back from the
-    file. Requires clouddevbox >= 1.7.2."""
+    """Resolve the AWS profile. Prefer delegating to clouddevbox's bullet
+    picker via `profile --out <file>` (>= 1.7.2, so the menu stays on the tty
+    and we read the answer from a file, since bullet's menu binds stdout at
+    import and can't be captured). Fall back to kora's own numbered picker if
+    clouddevbox is older, so a version mismatch never blocks a run."""
     if cli_profile:
         return cli_profile
     _require_clouddevbox()
@@ -2102,15 +2148,24 @@ def resolve_profile(cli_profile):
     out_file = out / f"profile-{os.getpid()}"
     out_file.unlink(missing_ok=True)
     try:
-        rc = subprocess.run(["clouddevbox", "profile", "--out", str(out_file)]).returncode
-        if rc != 0:
-            raise CliError("clouddevbox profile selection failed; pass --profile <p>")
-        profile = out_file.read_text().strip() if out_file.exists() else ""
+        # stdout+stdin on the tty (bullet menu usable); capture stderr so an
+        # old clouddevbox's argparse error is detectable, not printed raw.
+        p = subprocess.run(["clouddevbox", "profile", "--out", str(out_file)],
+                           stderr=subprocess.PIPE, text=True)
+        if p.returncode == 0 and out_file.exists():
+            profile = out_file.read_text().strip()
+        elif "--out" in (p.stderr or "") or "unrecognized arguments" in (p.stderr or ""):
+            log("clouddevbox lacks 'profile --out' (upgrade to >= 1.7.2 for its "
+                "bullet menu); using kora's built-in picker")
+            profile = _pick_profile_native()
+        else:
+            raise CliError("clouddevbox profile selection failed:\n"
+                           + (p.stderr or "").strip() + "\npass --profile <p>")
     finally:
         out_file.unlink(missing_ok=True)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", profile or ""):
         raise CliError(f"could not resolve a profile (got {profile!r}); "
-                       "pass --profile <p> or upgrade clouddevbox (>= 1.7.2)")
+                       "pass --profile <p>")
     return profile
 
 
