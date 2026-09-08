@@ -10,8 +10,9 @@ exit 1
 
 Manages exactly one virtual machine per state home (KORA_HOME). Local VMs run
 under tart (macOS guests + Linux guests on Apple Silicon), QEMU+hvf (Arch
-aarch64 on macOS, via the archboot unattended installer) or QEMU+KVM (official
-cloud images + cloud-init on Linux hosts). Cloud VMs are QEMU+KVM guests on a
+aarch64 on macOS, via the archboot unattended installer), QEMU+KVM (official
+cloud images + cloud-init on Linux hosts) or QEMU+KVM with a UEFI ISO install
+(omarchy, on x86_64 Linux hosts). Cloud VMs are QEMU+KVM guests on a
 persistent clouddevbox named 'kvm' (one per AWS profile); kora installs itself
 on the box and proxies verbs there, so the box-side state is the single source
 of truth - running kora on the box shows the same machine.
@@ -34,9 +35,13 @@ import time
 import uuid
 from pathlib import Path
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 
 HOST_OS = "darwin" if sys.platform == "darwin" else "linux"
+# os.uname() keeps the stdlib import list as-is; reports arm64 on Apple
+# Silicon, x86_64 on Linux/Intel. The x86 KVM backends need one of X86_ARCHES.
+HOST_ARCH = os.uname().machine
+X86_ARCHES = ("x86_64", "amd64")
 
 CLOUD_BOX = "kvm"           # the one persistent devbox kora uses, per AWS profile
 CLOUD_BOX_PLUGINS = "kauket,qemu"   # amun plugins converged at box creation
@@ -47,12 +52,13 @@ CLOUD_COST_LINE = ("the 'kvm' devbox is billable EC2 (m7i.large ~$0.10/h while r
 # Guest catalog. 'tart' images are cirruslabs OCI images; 'cloudimg' are the
 # official qcow2 cloud images used by the Linux QEMU+KVM backend (cloud-init
 # NoCloud). sequoia has no cloud/Linux story: macOS guests exist only under
-# tart on Apple Silicon. omarchy is cloud-only: an x86_64 UEFI ISO installer
-# (no tart/cloudimg), run via the qemu-omarchy backend on the KVM devbox.
+# tart on Apple Silicon. omarchy is an x86_64 UEFI ISO installer (no
+# tart/cloudimg) run by the qemu-omarchy backend, which works anywhere there is
+# x86_64 Linux + /dev/kvm: your own Linux host or the KVM devbox.
 #
 # Per-OS keys: tart (OCI image | None), cloudimg (qcow2 URL | None),
 # sve_fix (bool), and optionally: iso ({ver} URL template), backend (explicit
-# backend name), cloud_only (bool), instance_type (required EC2 type).
+# backend name), cloud_fresh_box (bool), instance_type (required EC2 type).
 CATALOG = {
     "tahoe": {
         "tart": "ghcr.io/cirruslabs/macos-tahoe-vanilla:latest",   # macOS 26
@@ -87,9 +93,15 @@ CATALOG = {
         "cloudimg": None,
         "iso": "https://iso.omarchy.org/omarchy-{ver}.iso",
         "backend": "qemu-omarchy",
-        "cloud_only": True,         # no local backend (Mac can't nest x86 KVM)
+        # Cloud only: a pristine box AT instance_type, and always --force.
+        # Whether it can run LOCALLY is a live host probe, not a catalog fact
+        # (see explicit_backend_block).
+        "cloud_fresh_box": True,
         "instance_type": "m7i.xlarge",
-        "long_install": True,       # ~15-40 min ISO install: run detached on the box
+        # Cloud only: the box-side install can't ride one SSH session, so it
+        # runs detached there (cloud_new_detached). Locally qemu is already
+        # daemonized, so the foreground poll is enough.
+        "long_install": True,       # ~15-40 min ISO install
         "sve_fix": False,
     },
 }
@@ -992,15 +1004,20 @@ def vm_ssh(vm, command, check=False, quiet=False):
     return rc
 
 
-def wait_ssh(vm, timeout, password=None):
+def wait_ssh(vm, timeout, password=None, heartbeat=None):
     """Poll until ssh answers. With password set, authenticate by password
     (sshpass if present, SSH_ASKPASS otherwise) - used before key injection.
 
     Each probe is hard-capped: ConnectTimeout only bounds the TCP connect, not
     the banner exchange, and a fresh guest whose sshd is still generating host
     keys can stall a probe indefinitely - a couple of those would otherwise
-    eat the whole budget."""
+    eat the whole budget.
+
+    heartbeat (seconds) logs elapsed minutes plus the guest's last console line,
+    so a long unattended install isn't silent. Off by default."""
     log(f"waiting for SSH on {vm['ssh']['host']}:{vm['ssh']['port']}")
+    started = time.time()
+    last_beat = started
     deadline = time.time() + timeout
     # -oConnectionAttempts + a subprocess timeout together bound each probe
     probe_extra = ["-o", "ConnectTimeout=4"]
@@ -1020,9 +1037,28 @@ def wait_ssh(vm, timeout, password=None):
             rc = 1      # banner stall - keep polling, do not burn the budget
         if rc == 0:
             return
+        if heartbeat and time.time() - last_beat >= heartbeat:
+            tail = _console_tail(vm)
+            log(f"  still waiting ({int((time.time() - started) / 60)}m)"
+                + (f": {tail[:100]}" if tail else ""))
+            last_beat = time.time()
         time.sleep(1)
     raise CliError(f"SSH not reachable after {timeout}s "
                    f"({vm['ssh']['host']}:{vm['ssh']['port']})")
+
+
+def _console_tail(vm):
+    """Last non-empty line of the guest serial console (-serial file:console.log
+    in qemu_common_argv), or '' when there is none."""
+    path = vm_dir(vm["name"]) / "console.log"
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            lines = [ln.strip() for ln in f.read().decode(errors="replace").splitlines()]
+    except OSError:
+        return ""
+    return next((ln for ln in reversed(lines) if ln), "")
 
 
 def _askpass_script(password):
@@ -1212,15 +1248,32 @@ def _qemu_stop(vm, graceful=True):
             pass
 
 
+def install_hint():
+    """Distro-accurate one-liner for the local qemu + OVMF + ISO-tool set.
+    Arch is matched via ID_LIKE, so Omarchy (ID=omarchy, ID_LIKE=arch) lands on
+    the pacman branch."""
+    rel = ""
+    try:
+        rel = Path("/etc/os-release").read_text()
+    except OSError:
+        pass
+    if re.search(r"^ID(_LIKE)?=.*\barch\b", rel, re.M):
+        base = "sudo pacman -S qemu-system-x86 edk2-ovmf cdrtools"
+    elif re.search(r"^ID(_LIKE)?=.*\b(debian|ubuntu)\b", rel, re.M):
+        base = "sudo apt-get install qemu-system-x86 qemu-utils ovmf genisoimage"
+    else:
+        base = "your distro's qemu-system-x86 + qemu-img + OVMF + genisoimage packages"
+    return f"{base} (or, homelab-sanctioned: amun qemu)"
+
+
 def ensure_iso_tool():
     for tool in ("genisoimage", "mkisofs"):
         if shutil.which(tool):
             return [tool]
     if shutil.which("xorriso"):
         return ["xorriso", "-as", "mkisofs"]
-    raise CliError("no ISO tool found (genisoimage/mkisofs/xorriso); install with "
-                   "'sudo apt-get install genisoimage' (Debian/Ubuntu), "
-                   "'sudo pacman -S cdrtools' (Arch) or converge the amun 'qemu' plugin")
+    raise CliError("no ISO tool found (genisoimage/mkisofs/xorriso); install with: "
+                   + install_hint())
 
 
 # ---------------------------------------------------------------------------
@@ -1666,9 +1719,8 @@ class QemuCloudimgBackend:
     @staticmethod
     def _ensure_tools():
         if not shutil.which("qemu-system-x86_64"):
-            raise CliError("qemu-system-x86_64 not found; install with "
-                           "'sudo apt-get install qemu-system-x86' or converge the "
-                           "amun 'qemu' plugin")
+            raise CliError("qemu-system-x86_64 not found; install with: "
+                           + install_hint())
         if not Path("/dev/kvm").exists():
             raise CliError("/dev/kvm missing - this host has no KVM (nested virt "
                            "disabled, or not a KVM-capable machine)")
@@ -1691,10 +1743,10 @@ class QemuCloudimgBackend:
 
 
 # ---------------------------------------------------------------------------
-# Omarchy (cloud-only): x86_64 UEFI ISO installer, unattended via a cidata
-# drive; installs to disk and auto-reboots into the finished system. Runs on
-# the KVM devbox. First install (~15-20 min) is snapshotted to a cached base
-# so every later new/reset is an instant COW overlay.
+# Omarchy (x86_64 KVM: a local Linux host or the KVM devbox): UEFI ISO
+# installer, unattended via a cidata drive; installs to disk and auto-reboots
+# into the finished system. First install (~15-40 min) is snapshotted to a
+# cached base so every later new/reset is an instant COW overlay.
 # ---------------------------------------------------------------------------
 def find_ovmf():
     """Locate x86_64 OVMF (UEFI) code + writable-vars template. Debian's 'ovmf'
@@ -1716,8 +1768,24 @@ def find_ovmf():
         varst = Path(str(code).replace("CODE", "VARS"))
         if varst.exists():
             return code, varst
-    raise CliError("OVMF firmware not found; install 'ovmf' (the amun qemu plugin "
-                   "does this) - looked under /usr/share/OVMF and /usr/share/edk2")
+    raise CliError(f"OVMF firmware not found (looked under {', '.join(roots)}); "
+                   f"install with: {install_hint()}")
+
+
+def omarchy_missing_deps():
+    """Local prerequisites the omarchy backend is missing, in install order.
+    Shared by _ensure_tools and cmd_list so the catalog table and the error
+    can't disagree. qemu-img matters: create/reset shell out to it."""
+    missing = [t for t in ("qemu-system-x86_64", "qemu-img") if not shutil.which(t)]
+    if not any(shutil.which(t) for t in ("genisoimage", "mkisofs", "xorriso")):
+        missing.append("genisoimage/mkisofs/xorriso")
+    if not shutil.which("openssl"):
+        missing.append("openssl")           # user password hash
+    try:
+        find_ovmf()
+    except CliError:
+        missing.append("OVMF firmware")
+    return missing
 
 
 def omarchy_iso_url():
@@ -1890,7 +1958,10 @@ def qemu_omarchy_argv(vm, install=False):
 def _qmp_powerdown(vm, timeout=180):
     """Clean ACPI shutdown via QMP - no guest sudo needed (gonzalo's sudo may
     prompt). Falls back to SIGTERM/SIGKILL. Used before snapshotting the base
-    so the qcow2 is quiesced."""
+    so the qcow2 is quiesced.
+
+    Returns True only when the guest really shut itself down: a SIGKILLed image
+    is not safe to cache as the base for every future VM (callers check)."""
     sock_path = vm.get("qemu", {}).get("qmp_sock")
     if sock_path and Path(sock_path).exists():
         try:
@@ -1903,24 +1974,52 @@ def _qmp_powerdown(vm, timeout=180):
             s.close()
         except OSError:
             pass
-    if not _qemu_wait_exit(vm, timeout):
-        _qemu_stop(vm, graceful=False)
+    if _qemu_wait_exit(vm, timeout):
+        return True
+    _qemu_stop(vm, graceful=False)
+    return False
 
 
 class QemuOmarchyBackend:
     name = "qemu-omarchy"
 
     @staticmethod
+    def _guest_poweroff(vm, timeout=180):
+        """Shut the guest down from the inside; ACPI is only the fallback.
+
+        Omarchy ships HandlePowerKey=ignore (/etc/systemd/logind.conf.d/
+        10-ignore-power-button.conf), so QMP's system_powerdown is silently
+        dropped and _qmp_powerdown alone always ends in SIGKILL - survivable
+        for a throwaway guest, but not for an image about to become the cached
+        base of every future VM. `sudo -S` with the disposable install password
+        is deterministic (the guest is down in ~5s); ACPI still covers a guest
+        whose sshd never came up. Returns True only on a clean shutdown."""
+        cmd = (f"printf '%s\\n' {shlex.quote(OMARCHY_PASSWORD)} "
+               "| sudo -S systemctl poweroff")
+        try:
+            run(ssh_argv(vm, cmd), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=30)
+        except subprocess.TimeoutExpired:
+            pass        # the connection dies with the guest - expected
+        if _qemu_wait_exit(vm, timeout):
+            return True
+        return _qmp_powerdown(vm, timeout)
+
+    @staticmethod
     def _ensure_tools():
-        if not shutil.which("qemu-system-x86_64"):
-            raise CliError("qemu-system-x86_64 not found; converge the amun 'qemu' "
-                           "plugin or apt-get install qemu-system-x86")
+        # Report everything that's missing at once - each retry otherwise costs
+        # a 5.8 GiB ISO download before the next tool fails.
+        missing = omarchy_missing_deps()
+        if missing:
+            raise CliError(f"omarchy needs {', '.join(missing)}; install with: "
+                           + install_hint())
         if not Path("/dev/kvm").exists():
-            raise CliError("/dev/kvm missing - omarchy needs nested KVM")
-        if not shutil.which("openssl"):
-            raise CliError("openssl not found (needed for the user password hash)")
-        ensure_iso_tool()
-        find_ovmf()
+            raise CliError("/dev/kvm missing - omarchy needs x86_64 KVM (not a "
+                           "KVM-capable host, or virtualization is off in firmware)")
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            raise CliError("/dev/kvm is not readable/writable by this user; join "
+                           "the 'kvm' group (amun qemu does this) and start a new "
+                           "session, or `newgrp kvm` in this shell")
 
     @classmethod
     def _fetch_iso(cls):
@@ -1977,7 +2076,8 @@ class QemuOmarchyBackend:
 
         # First install: build the base.
         log(f"no cached base for {base_key}; running the Omarchy installer "
-            "(~15-20 min, unattended)")
+            "(unattended; a couple of minutes on a fast local host, up to "
+            "~40 min on the cloud box)")
         base_dir.mkdir(parents=True, exist_ok=True)
         gen_vm_key(base_dir)                       # stable base key
         pub = (base_dir / "id_ed25519.pub").read_text().strip()
@@ -1992,9 +2092,14 @@ class QemuOmarchyBackend:
             raise CliError("qemu installer boot failed")
         log("waiting for the unattended install to finish and reboot (SSH poll, "
             "40 min deadline)")
-        wait_ssh(vm, 2400)                         # install auto-reboots; poll ssh
+        # install auto-reboots; poll ssh, reporting progress from the console
+        wait_ssh(vm, 2400, heartbeat=120)
+        # Only a guest that shut itself down leaves a quiesced image. Caching a
+        # SIGKILLed btrfs would poison every future new/reset from this base.
+        if not cls._guest_poweroff(vm):
+            raise CliError("guest did not shut down cleanly after the install; "
+                           "not caching this base - re-run `kora new omarchy`")
         log("install complete; snapshotting the base for future new/reset")
-        _qmp_powerdown(vm)
         shutil.copy(d / "disk.qcow2", base_disk)
         shutil.copy(d / "OVMF_VARS.fd", base_vars)
         # switch this run onto an overlay of the base so the base stays pristine
@@ -2022,7 +2127,9 @@ class QemuOmarchyBackend:
 
     @classmethod
     def stop(cls, vm):
-        _qmp_powerdown(vm)
+        # ACPI alone can't stop an Omarchy guest (see _guest_poweroff), so
+        # `kora stop` would hard-kill the disk it promises to keep.
+        cls._guest_poweroff(vm)
 
     @classmethod
     def destroy(cls, vm):
@@ -2031,11 +2138,15 @@ class QemuOmarchyBackend:
     @classmethod
     def reset(cls, vm):
         """Wipe the guest back to the cached base without reinstalling."""
-        _qmp_powerdown(vm)
+        cls._guest_poweroff(vm)
         base_dir = cache_dir("omarchy-base") / cls._base_key_for(vm)
         base_disk, base_vars = base_dir / "base.qcow2", base_dir / "OVMF_VARS.fd"
-        if not base_disk.exists():
-            raise CliError("no cached base to reset from; run 'kora rm' + 'kora new'")
+        # Both files are needed (create's guard checks the same pair): a base
+        # missing its UEFI vars would otherwise raise a raw FileNotFoundError
+        # from _overlay_from_base's copy.
+        if not (base_disk.exists() and base_vars.exists()):
+            raise CliError("no complete cached base to reset from; run 'kora rm' "
+                           "+ 'kora new'")
         cls._overlay_from_base(vm, base_disk, base_vars)
         if run(qemu_omarchy_argv(vm, install=False)).returncode != 0:
             raise CliError("qemu boot failed")
@@ -2056,19 +2167,37 @@ BACKENDS = {b.name: b for b in (TartBackend, QemuArchBackend,
                                 QemuCloudimgBackend, QemuOmarchyBackend)}
 
 
+def explicit_backend_block(spec):
+    """Why an explicit-backend OS (omarchy: x86_64 KVM) can't run on THIS host,
+    as (short, detail), or (None, None) when it can. Shared by backend_name_for
+    and cmd_list so the catalog table can never claim something different from
+    what `kora new` will do. Returns (None, None) on the KVM devbox, which is
+    what keeps the cloud path's behavior unchanged."""
+    if HOST_OS != "linux":
+        return ("no x86 KVM (macOS host)",
+                "macOS hvf cannot nest x86 virtualization")
+    if HOST_ARCH not in X86_ARCHES:
+        return (f"needs x86_64 host ({HOST_ARCH})",
+                "KVM cannot accelerate a foreign guest architecture, and the "
+                "backend runs qemu-system-x86_64 -cpu host")
+    if not Path("/dev/kvm").exists():
+        return ("no /dev/kvm",
+                "not a KVM-capable host, or virtualization is disabled in firmware")
+    return (None, None)
+
+
 def backend_name_for(os_name):
-    """Host-platform dispatch for local creation. On the KVM devbox (linux)
-    this resolves the real backend that boots the guest; on the Mac it decides
-    whether the OS can run locally at all."""
+    """Host-platform dispatch for local creation: resolves the backend that
+    boots the guest, or explains why this host can't run it locally."""
     if os_name not in CATALOG:
         raise CliError(f"unknown OS '{os_name}' (kora list shows the catalog)")
     spec = CATALOG[os_name]
-    # OS with an explicit backend (omarchy) - runs only where that backend can
-    # (linux + /dev/kvm). On the Mac it's cloud-only.
+    # OS with an explicit backend (omarchy) - runs wherever that backend can.
     if spec.get("backend"):
-        if HOST_OS != "linux" or not Path("/dev/kvm").exists():
-            raise CliError(f"'{os_name}' is cloud-only (needs x86 KVM); use: "
-                           f"kora new {os_name} --cloud")
+        short, detail = explicit_backend_block(spec)
+        if short:
+            raise CliError(f"'{os_name}' cannot run locally here: {short} "
+                           f"({detail}); use: kora new {os_name} --cloud")
         return spec["backend"]
     if HOST_OS == "darwin":
         return "tart" if spec["tart"] else "qemu-arch"
@@ -2373,16 +2502,16 @@ def cloud_new(args):
     profile = resolve_profile(args.profile)
     log(f"cloud mode: devbox '{CLOUD_BOX}', profile {profile}")
     instance_type = spec.get("instance_type")
-    fresh = bool(spec.get("cloud_only"))   # omarchy: pristine box at its type
+    fresh = bool(spec.get("cloud_fresh_box"))   # omarchy: pristine box at its type
     ensure_devbox(profile, args.yes, instance_type=instance_type, fresh=fresh)
     sha = ensure_remote_kora(profile)
     new_args = ["new", args.os]
     for flag, val in (("--ram", args.ram), ("--cpu", args.cpu), ("--hd", args.hd)):
         if val:
             new_args += [flag, str(val)]
-    # A reused box may carry a stale guest; cloud_only guests are always
+    # A reused box may carry a stale guest; cloud_fresh_box guests are always
     # rebuilt from the cached base, so force past any existing one.
-    if args.force or spec.get("cloud_only"):
+    if args.force or spec.get("cloud_fresh_box"):
         new_args.append("--force")
     if spec.get("long_install"):
         # A ~15-40 min unattended install can't ride a single foreground SSH
@@ -2656,9 +2785,16 @@ def cmd_list(args):
     have_cdb = shutil.which("clouddevbox") is not None
     print(f"{'OS':<10}{'LOCAL':<38}CLOUD")
     for os_name, spec in CATALOG.items():
-        cloud_only = spec.get("cloud_only")
-        if cloud_only:
-            local = "-- (cloud only)"
+        if spec.get("backend"):
+            # omarchy: an explicit x86_64 KVM backend - ask the same oracle
+            # `kora new` asks, then report what's still missing.
+            short, _ = explicit_backend_block(spec)
+            if short:
+                local = f"-- ({short})"
+            else:
+                missing = omarchy_missing_deps()
+                local = ("qemu+kvm (ISO install)" if not missing
+                         else f"needs {', '.join(missing[:2])}")
         elif HOST_OS == "darwin":
             if spec["tart"]:
                 local = f"tart ({spec['tart'].split('/')[-1]})" if have_tart else \
@@ -2672,7 +2808,9 @@ def cmd_list(args):
                     "needs qemu-system-x86 + /dev/kvm"
             else:
                 local = "-- (Apple Silicon Mac only)"
-        if spec["cloudimg"] is None and not cloud_only:
+        # Same predicate cloud_new uses: a cloud story means a cloud image or
+        # an explicit backend (macOS-only guests have neither).
+        if not (spec["cloudimg"] or spec.get("backend")):
             cloud = "--"
         else:
             itype = spec.get("instance_type")
@@ -2774,9 +2912,14 @@ def _open_url(url):
         run(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _vnc_login_hint(state):
+def _vnc_login_hint(state, url=None):
     """The QEMU VNC server has no password; the desktop login/lock screen does.
-    Print the guest credentials so the operator knows what to type."""
+    Print the guest credentials so the operator knows what to type. On Linux
+    also name a client, since _open_url only opens on macOS and no vnc://
+    handler is registered on a typical Linux desktop."""
+    if url and HOST_OS == "linux":
+        print(f"client: vncviewer {url.removeprefix('vnc://')}   "
+              "(pacman -S tigervnc / apt-get install tigervnc-viewer)")
     if state["os"] == "omarchy":
         print(f"desktop login: {OMARCHY_USER} / {OMARCHY_PASSWORD}  "
               "(no VNC password - this is Omarchy's login/lock screen)")
@@ -2789,7 +2932,7 @@ def cmd_vnc(args):
         hop, hop_port = cloud_tunnel(state, 5900 + disp, *VNC_LOCAL_RANGE)
         url = f"vnc://127.0.0.1:{hop_port}"
         print(url)
-        _vnc_login_hint(state)
+        _vnc_login_hint(state, url)
         print("(tunnel held open - ctrl-c to close)")
         _open_url(url)
         try:
@@ -2806,7 +2949,7 @@ def cmd_vnc(args):
     if not url:
         raise CliError(f"no VNC URL yet - check {state.get('tart', {}).get('log', '?')}")
     print(url)
-    _vnc_login_hint(state)
+    _vnc_login_hint(state, url)
     _open_url(url)
 
 
@@ -2822,7 +2965,8 @@ def build_parser():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("new", help="create the VM (fails if one exists; --force replaces)")
-    p.add_argument("os", help="debian | ubuntu | arch | sequoia | tahoe (see kora list)")
+    p.add_argument("os", help="debian | ubuntu | arch | omarchy | sequoia | tahoe "
+                              "(see kora list)")
     p.add_argument("--ram", help="memory, e.g. 2G or 2048M")
     p.add_argument("--cpu", type=int, help="vCPUs")
     p.add_argument("--hd", help="disk size, e.g. 20G")
